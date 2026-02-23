@@ -65,6 +65,7 @@ models:
     xgboost_weight: 0.6
   save_dir: data/models
   train_split: 0.8
+  staleness_warning_days: 30
 
 signals:
   confidence_threshold: 0.6

@@ -3,6 +3,7 @@
 import click
 from rich.console import Console
 
+from stock_prediction.config import get_setting
 from stock_prediction.utils.logging import setup_logging
 
 console = Console()
@@ -68,10 +69,14 @@ def predict(symbols: str | None, export: bool, no_news: bool, no_llm: bool):
     screener_result = screener.screen(symbol_list)
 
     # Generate predictions for each stock
+    staleness_threshold = get_setting("models", "staleness_warning_days", default=30)
+
     signals = []
     for symbol in symbol_list:
         try:
-            ensemble, scaler, seq_scaler = trainer.load_models(symbol)
+            ensemble, scaler, seq_scaler, model_age_days = trainer.load_models(symbol)
+            if model_age_days is not None and model_age_days > staleness_threshold:
+                console.print(f"[yellow]Warning: Model for {symbol} is {model_age_days} days old. Consider retraining.[/]")
             pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm)
             df = pipeline.build_features(symbol)
 
@@ -177,7 +182,10 @@ def analyze(symbol: str, no_news: bool, no_llm: bool):
     signal = None
     try:
         trainer = ModelTrainer()
-        ensemble, scaler, seq_scaler = trainer.load_models(symbol)
+        ensemble, scaler, seq_scaler, model_age_days = trainer.load_models(symbol)
+        staleness_threshold = get_setting("models", "staleness_warning_days", default=30)
+        if model_age_days is not None and model_age_days > staleness_threshold:
+            console.print(f"[yellow]Warning: Model for {symbol} is {model_age_days} days old. Consider retraining.[/]")
         pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm)
         df = pipeline.build_features(symbol)
 
@@ -231,6 +239,25 @@ def analyze(symbol: str, no_news: bool, no_llm: bool):
             top_headlines=headlines,
         )
         reporter.display_stock_analysis(fallback, llm_scores)
+
+
+@cli.command()
+@click.option("--count", "-n", default=10, help="Number of stocks to suggest")
+@click.option("--no-news", is_flag=True, help="Skip news scoring (technical-only)")
+def suggest(count: int, no_news: bool):
+    """Suggest top NIFTY 50 stocks ranked by momentum and news."""
+    from stock_prediction.signals.screener import StockScreener
+    from stock_prediction.signals.report import ReportFormatter
+
+    use_news = not no_news
+    mode = "technical-only" if no_news else "technical + news"
+    console.print(f"Finding top {count} stocks ({mode})...")
+
+    screener = StockScreener()
+    result = screener.suggest(count=count, use_news=use_news)
+
+    reporter = ReportFormatter()
+    reporter.display_suggestions(result)
 
 
 @cli.command("fetch-data")
