@@ -8,6 +8,7 @@ ML-powered stock prediction system for Indian markets (NSE/BSE) combining techni
 - **Technical Analysis**: RSI, MACD, Bollinger Bands, SMA, EMA, ATR, Stochastic
 - **News Sentiment**: Google News RSS + FinBERT sentiment analysis
 - **LLM Broker Insights**: Ollama-powered analysis of news articles
+- **Stock Suggestions**: Curated initial watchlist from NIFTY 50 ranked by momentum + news
 - **Stock Screener**: Top picks, sector momentum, news alerts
 - **Paper Trading**: Simulated buy/sell/short trades with gain/loss reporting
 
@@ -68,6 +69,16 @@ stockpredict predict --no-news --no-llm                       # Technical-only p
 stockpredict analyze --symbol RELIANCE.NS
 stockpredict analyze --symbol RELIANCE.NS --no-llm    # Skip LLM broker analysis
 stockpredict analyze --symbol RELIANCE.NS --no-news   # Skip news features entirely
+```
+
+### Suggest Stocks
+
+Get a curated watchlist of top NIFTY 50 stocks ranked by technical momentum and news sentiment.
+
+```bash
+stockpredict suggest                       # Top 10 stocks (default)
+stockpredict suggest --count 5             # Top 5 stocks
+stockpredict suggest --count 10 --no-news  # Technical-only ranking
 ```
 
 ### Stock Screener
@@ -137,3 +148,8 @@ pytest tests/ -v
 ## Configuration
 
 All settings are in `config/settings.yaml` — model hyperparameters, feature parameters, signal thresholds, and paper trading paths.
+
+## Future Enhancements
+
+- **Generic cross-stock model**: Train a single model on a diverse set of stocks using normalized, stock-agnostic features (e.g. returns, relative volume, RSI, sector encoding) so it learns general market patterns rather than stock-specific ones. This generic model could predict any stock — including ones it was never trained on — and only needs retraining at longer intervals. The existing per-stock models would remain available for higher-accuracy predictions on frequently traded stocks.
+- **Model staleness warning**: Save a `trained_at` timestamp in model metadata. When loading a model for prediction, check its age against a configurable threshold (e.g. 30 days) and display a warning if the model is stale, prompting the user to retrain.

@@ -1,5 +1,6 @@
 """Training orchestration for stock prediction models."""
 
+from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -108,8 +109,12 @@ class ModelTrainer:
                 results[symbol] = None
         return results
 
-    def load_models(self, symbol: str) -> tuple[EnsembleModel, StandardScaler, StandardScaler]:
-        """Load trained models for a symbol."""
+    def load_models(self, symbol: str) -> tuple[EnsembleModel, StandardScaler, StandardScaler, int | None]:
+        """Load trained models for a symbol.
+
+        Returns (ensemble, scaler, seq_scaler, model_age_days).
+        model_age_days is None if the model has no trained_at timestamp.
+        """
         model_dir = self.save_dir / symbol.replace(".", "_")
 
         lstm_path = model_dir / "lstm.pt"
@@ -128,7 +133,14 @@ class ModelTrainer:
         xgb.load(xgb_path)
 
         ensemble = EnsembleModel(lstm, xgb)
-        return ensemble, meta["scaler"], meta["seq_scaler"]
+
+        model_age_days = None
+        trained_at = meta.get("trained_at")
+        if trained_at:
+            trained_dt = datetime.fromisoformat(trained_at)
+            model_age_days = (datetime.now() - trained_dt).days
+
+        return ensemble, meta["scaler"], meta["seq_scaler"], model_age_days
 
     def _save_models(
         self,
@@ -149,6 +161,7 @@ class ModelTrainer:
             "seq_scaler": seq_scaler,
             "feature_names": feature_names,
             "input_size": lstm.input_size,
+            "trained_at": datetime.now().isoformat(),
         }, model_dir / "meta.joblib")
 
         logger.info(f"Saved models for {symbol} to {model_dir}")
