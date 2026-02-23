@@ -1,0 +1,75 @@
+sectors:
+  IT:
+    - { symbol: "TCS.NS", name: "Tata Consultancy Services" }
+    - { symbol: "INFY.NS", name: "Infosys" }
+    - { symbol: "HCLTECH.NS", name: "HCL Technologies" }
+    - { symbol: "WIPRO.NS", name: "Wipro" }
+    - { symbol: "TECHM.NS", name: "Tech Mahindra" }
+    - { symbol: "LTIM.NS", name: "LTIMindtree" }
+
+  Banking:
+    - { symbol: "HDFCBANK.NS", name: "HDFC Bank" }
+    - { symbol: "ICICIBANK.NS", name: "ICICI Bank" }
+    - { symbol: "KOTAKBANK.NS", name: "Kotak Mahindra Bank" }
+    - { symbol: "AXISBANK.NS", name: "Axis Bank" }
+    - { symbol: "SBIN.NS", name: "State Bank of India" }
+    - { symbol: "INDUSINDBK.NS", name: "IndusInd Bank" }
+
+  Financial_Services:
+    - { symbol: "BAJFINANCE.NS", name: "Bajaj Finance" }
+    - { symbol: "BAJAJFINSV.NS", name: "Bajaj Finserv" }
+    - { symbol: "SBILIFE.NS", name: "SBI Life Insurance" }
+    - { symbol: "HDFCLIFE.NS", name: "HDFC Life Insurance" }
+
+  Oil_Gas_Energy:
+    - { symbol: "RELIANCE.NS", name: "Reliance Industries" }
+    - { symbol: "ONGC.NS", name: "Oil and Natural Gas Corporation" }
+    - { symbol: "NTPC.NS", name: "NTPC" }
+    - { symbol: "POWERGRID.NS", name: "Power Grid Corporation" }
+    - { symbol: "ADANIENT.NS", name: "Adani Enterprises" }
+    - { symbol: "ADANIPORTS.NS", name: "Adani Ports" }
+    - { symbol: "COALINDIA.NS", name: "Coal India" }
+    - { symbol: "BPCL.NS", name: "Bharat Petroleum" }
+
+  Pharma_Healthcare:
+    - { symbol: "SUNPHARMA.NS", name: "Sun Pharmaceutical" }
+    - { symbol: "DRREDDY.NS", name: "Dr Reddys Laboratories" }
+    - { symbol: "CIPLA.NS", name: "Cipla" }
+    - { symbol: "APOLLOHOSP.NS", name: "Apollo Hospitals" }
+
+  Automobile:
+    - { symbol: "MARUTI.NS", name: "Maruti Suzuki" }
+    - { symbol: "TATAMOTORS.NS", name: "Tata Motors" }
+    - { symbol: "M&M.NS", name: "Mahindra and Mahindra" }
+    - { symbol: "BAJAJ-AUTO.NS", name: "Bajaj Auto" }
+    - { symbol: "EICHERMOT.NS", name: "Eicher Motors" }
+    - { symbol: "HEROMOTOCO.NS", name: "Hero MotoCorp" }
+
+  FMCG:
+    - { symbol: "HINDUNILVR.NS", name: "Hindustan Unilever" }
+    - { symbol: "ITC.NS", name: "ITC" }
+    - { symbol: "NESTLEIND.NS", name: "Nestle India" }
+    - { symbol: "BRITANNIA.NS", name: "Britannia Industries" }
+    - { symbol: "TATACONSUM.NS", name: "Tata Consumer Products" }
+
+  Metals_Mining:
+    - { symbol: "TATASTEEL.NS", name: "Tata Steel" }
+    - { symbol: "JSWSTEEL.NS", name: "JSW Steel" }
+    - { symbol: "HINDALCO.NS", name: "Hindalco Industries" }
+
+  Cement_Construction:
+    - { symbol: "ULTRACEMCO.NS", name: "UltraTech Cement" }
+    - { symbol: "GRASIM.NS", name: "Grasim Industries" }
+    - { symbol: "SHREECEM.NS", name: "Shree Cement" }
+
+  Telecom:
+    - { symbol: "BHARTIARTL.NS", name: "Bharti Airtel" }
+
+  Conglomerate:
+    - { symbol: "LT.NS", name: "Larsen and Toubro" }
+
+  Other:
+    - { symbol: "TITAN.NS", name: "Titan Company" }
+    - { symbol: "ASIANPAINT.NS", name: "Asian Paints" }
+    - { symbol: "DIVISLAB.NS", name: "Divis Laboratories" }
+    - { symbol: "WIPRO.NS", name: "Wipro" }
