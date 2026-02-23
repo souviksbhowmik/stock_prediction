@@ -9,6 +9,7 @@ ML-powered stock prediction system for Indian markets (NSE/BSE) combining techni
 - **News Sentiment**: Google News RSS + FinBERT sentiment analysis
 - **LLM Broker Insights**: Ollama-powered analysis of news articles
 - **Stock Suggestions**: Curated initial watchlist from NIFTY 50 ranked by momentum + news
+- **Stock Shortlist**: Buy/short candidates from NIFTY 50 + trending non-NIFTY stocks from news
 - **Stock Screener**: Top picks, sector momentum, news alerts
 - **Paper Trading**: Simulated buy/sell/short trades with gain/loss reporting
 
@@ -80,6 +81,22 @@ stockpredict suggest                       # Top 10 stocks (default)
 stockpredict suggest --count 5             # Top 5 stocks
 stockpredict suggest --count 10 --no-news  # Technical-only ranking
 ```
+
+### Shortlist Stocks
+
+Discover stocks to trade — combines NIFTY 50 technical screening with news-driven discovery of non-NIFTY stocks.
+
+```bash
+stockpredict shortlist                       # Top 5 buy + short candidates (default)
+stockpredict shortlist -n 3                  # Top 3 buy + short candidates
+stockpredict shortlist -n 5 --no-news        # Technical-only (no trending section)
+stockpredict shortlist -n 5 --no-llm         # News alias matching only, skip LLM discovery
+```
+
+Returns three sections:
+- **Buy Candidates**: Top N NIFTY 50 stocks ranked by momentum, volume, and technicals
+- **Short Candidates**: Top N weak stocks with negative momentum, overbought RSI, or bearish SMA crossover
+- **Trending from News**: Non-NIFTY stocks discovered from news headlines, fetched and scored
 
 ### Stock Screener
 

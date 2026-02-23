@@ -49,6 +49,17 @@ class SuggestionResult:
 
 
 @dataclass
+class ShortlistResult:
+    """Result from the shortlist pipeline."""
+
+    buy_candidates: list[StockSuggestion]
+    short_candidates: list[StockSuggestion]
+    trending: list[StockSuggestion]
+    total_screened: int
+    news_articles_scanned: int
+
+
+@dataclass
 class ScreenerResult:
     """Result from stock screening."""
 
@@ -225,6 +236,244 @@ class StockScreener:
             suggestions=suggestions,
             total_screened=len(stock_scores),
             news_articles_scanned=news_articles_scanned,
+        )
+
+    def shortlist(
+        self,
+        count: int = 5,
+        use_news: bool = True,
+        use_llm: bool = True,
+    ) -> ShortlistResult:
+        """Shortlist stocks for buying, shorting, and trending from news.
+
+        Scores NIFTY 50 stocks and picks top N for buying and bottom N for
+        shorting. Optionally scans news for non-NIFTY trending tickers.
+        """
+        symbols = NIFTY_50_TICKERS
+        stock_scores: list[dict] = []
+
+        # --- Fetch news and count mentions ---
+        news_counts: dict[str, int] = {}
+        news_articles_scanned = 0
+        non_nifty_tickers: list[str] = []
+        nifty_set = set(symbols)
+
+        if use_news:
+            try:
+                fetcher = GoogleNewsRSSFetcher()
+                articles = fetcher.fetch_market_news()
+                news_articles_scanned = len(articles)
+
+                alias_to_ticker: dict[str, str] = {}
+                for alias, ticker in COMPANY_ALIASES.items():
+                    alias_to_ticker[alias.lower()] = ticker
+                for ticker, name in TICKER_TO_NAME.items():
+                    alias_to_ticker[name.lower()] = ticker
+                    bare = ticker.replace(".NS", "").lower()
+                    alias_to_ticker[bare] = ticker
+
+                for article in articles:
+                    text = (article.title + " " + article.snippet).lower()
+                    matched_tickers: set[str] = set()
+                    for alias, ticker in alias_to_ticker.items():
+                        if alias in text:
+                            matched_tickers.add(ticker)
+                    for ticker in matched_tickers:
+                        news_counts[ticker] = news_counts.get(ticker, 0) + 1
+
+                # Identify non-NIFTY tickers from news
+                for ticker, mention_count in news_counts.items():
+                    if ticker not in nifty_set and mention_count >= 1:
+                        non_nifty_tickers.append(ticker)
+
+                # LLM-based discovery as fallback
+                if use_llm and len(non_nifty_tickers) < 3:
+                    try:
+                        llm_alerts = self._news_discovery()
+                        for alert in llm_alerts:
+                            t = alert.get("ticker", "")
+                            if t and not t.endswith(".NS"):
+                                t = t + ".NS"
+                            if t and t not in nifty_set and t not in non_nifty_tickers:
+                                non_nifty_tickers.append(t)
+                    except Exception as e:
+                        logger.warning(f"LLM news discovery failed: {e}")
+            except Exception as e:
+                logger.warning(f"News fetch failed for shortlist: {e}")
+
+        # --- Score NIFTY 50 stocks ---
+        for symbol in symbols:
+            scored = self._score_stock(symbol, news_counts)
+            if scored is not None:
+                stock_scores.append(scored)
+
+        total_screened = len(stock_scores)
+
+        # --- Buy candidates: top N by score ---
+        stock_scores.sort(key=lambda x: x["score"], reverse=True)
+        buy_candidates = [
+            self._to_suggestion(i + 1, s) for i, s in enumerate(stock_scores[:count])
+        ]
+
+        # --- Short candidates: bottom N by short score ---
+        short_scored = []
+        for s in stock_scores:
+            ss = 0.0
+            s_reasons: list[str] = []
+
+            # Negative momentum is good for shorting
+            momentum = s["return_1w"] * 0.6 + s["return_1m"] * 0.4
+            if momentum < 0:
+                ss += min(3.0, abs(momentum) / 3.0)
+                if s["return_1w"] < -2:
+                    s_reasons.append(f"Weak 1W ({s['return_1w']:+.1f}%)")
+                if s["return_1m"] < -5:
+                    s_reasons.append(f"Weak 1M ({s['return_1m']:+.1f}%)")
+
+            # Overbought RSI is a bearish signal
+            if s["rsi"] > 70:
+                ss += 2.0
+                s_reasons.append(f"Overbought (RSI={s['rsi']:.0f})")
+
+            # Below SMA 50 (bearish)
+            if s.get("below_sma50"):
+                ss += 1.5
+                s_reasons.append("Below SMA 50")
+
+            # Bearish SMA crossover
+            if s.get("bearish_cross"):
+                ss += 2.0
+                s_reasons.append("Bearish SMA 20/50 crossover")
+
+            if ss > 0:
+                if not s_reasons:
+                    s_reasons.append("Weak momentum")
+                short_scored.append({**s, "short_score": ss, "short_reasons": s_reasons})
+
+        short_scored.sort(key=lambda x: x["short_score"], reverse=True)
+        short_candidates = [
+            self._to_suggestion(i + 1, s, reasons_override=s["short_reasons"])
+            for i, s in enumerate(short_scored[:count])
+        ]
+
+        # --- Trending from news (non-NIFTY) ---
+        trending: list[StockSuggestion] = []
+        for ticker in non_nifty_tickers[:10]:
+            scored = self._score_stock(ticker, news_counts)
+            if scored is not None:
+                total_screened += 1
+                trending.append(self._to_suggestion(len(trending) + 1, scored))
+
+        return ShortlistResult(
+            buy_candidates=buy_candidates,
+            short_candidates=short_candidates,
+            trending=trending,
+            total_screened=total_screened,
+            news_articles_scanned=news_articles_scanned,
+        )
+
+    def _score_stock(self, symbol: str, news_counts: dict[str, int]) -> dict | None:
+        """Score a single stock on technical indicators. Returns None on failure."""
+        try:
+            stock_data = self.data_provider.fetch_historical(symbol)
+            if stock_data.is_empty or len(stock_data.df) < 60:
+                return None
+
+            df = add_technical_indicators(stock_data.df)
+            if df.empty:
+                return None
+
+            latest = df.iloc[-1]
+            score = 0.0
+            reasons: list[str] = []
+
+            price = float(latest["Close"])
+            ret_1w = (df["Close"].iloc[-1] / df["Close"].iloc[-5] - 1) * 100
+            ret_1m = (df["Close"].iloc[-1] / df["Close"].iloc[-20] - 1) * 100
+
+            momentum = float(ret_1w * 0.6 + ret_1m * 0.4)
+            momentum_score = max(0.0, min(3.0, momentum / 3.0 + 1.5))
+            score += momentum_score
+            if ret_1w > 2:
+                reasons.append(f"Strong 1W return ({ret_1w:+.1f}%)")
+            if ret_1m > 5:
+                reasons.append(f"Strong 1M return ({ret_1m:+.1f}%)")
+
+            if "Volume_Ratio" in latest and latest["Volume_Ratio"] > self.volume_spike:
+                score += 2.0
+                reasons.append(f"Volume spike ({latest['Volume_Ratio']:.1f}x)")
+
+            rsi = float(latest.get("RSI", 50))
+            if rsi < 30:
+                score += 1.5
+                reasons.append(f"Oversold (RSI={rsi:.0f})")
+            elif rsi > 70:
+                score += 1.0
+                reasons.append(f"Overbought (RSI={rsi:.0f})")
+
+            # SMA crossover detection
+            bullish_cross = False
+            bearish_cross = False
+            below_sma50 = False
+            if "SMA_20_50_Cross" in latest:
+                sma_cross_prev = df["SMA_20_50_Cross"].iloc[-2] if len(df) > 1 else 0
+                if latest["SMA_20_50_Cross"] == 1 and sma_cross_prev == 0:
+                    score += 2.0
+                    reasons.append("Bullish SMA 20/50 crossover")
+                    bullish_cross = True
+                elif latest["SMA_20_50_Cross"] == 0 and sma_cross_prev == 1:
+                    bearish_cross = True
+
+            if "SMA_50" in latest and price < float(latest["SMA_50"]):
+                below_sma50 = True
+
+            high_52w = df["Close"].tail(252).max() if len(df) >= 252 else df["Close"].max()
+            if price >= high_52w * 0.95:
+                score += 1.5
+                reasons.append("Near 52-week high")
+
+            mentions = news_counts.get(symbol, 0)
+            if mentions > 0:
+                news_score = min(2.0, mentions * 0.5)
+                score += news_score
+                reasons.append(f"{mentions} news mention(s)")
+
+            if not reasons:
+                reasons.append("Baseline momentum")
+
+            return {
+                "symbol": symbol,
+                "name": TICKER_TO_NAME.get(symbol, symbol.replace(".NS", "")),
+                "price": price,
+                "return_1w": float(ret_1w),
+                "return_1m": float(ret_1m),
+                "rsi": rsi,
+                "news_mentions": mentions,
+                "score": score,
+                "reasons": reasons,
+                "below_sma50": below_sma50,
+                "bearish_cross": bearish_cross,
+            }
+        except Exception as e:
+            logger.warning(f"Scoring failed for {symbol}: {e}")
+            return None
+
+    @staticmethod
+    def _to_suggestion(
+        rank: int, s: dict, reasons_override: list[str] | None = None,
+    ) -> StockSuggestion:
+        """Convert a scored dict to a StockSuggestion."""
+        return StockSuggestion(
+            rank=rank,
+            symbol=s["symbol"],
+            name=s["name"],
+            price=s["price"],
+            return_1w=s["return_1w"],
+            return_1m=s["return_1m"],
+            rsi=s["rsi"],
+            news_mentions=s["news_mentions"],
+            score=s.get("short_score", s["score"]),
+            reasons=reasons_override or s["reasons"],
         )
 
     def _pre_screen(self, symbols: list[str]) -> list[dict]:

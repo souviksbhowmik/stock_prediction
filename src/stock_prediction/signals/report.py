@@ -15,7 +15,7 @@ from rich.text import Text
 
 from stock_prediction.config import get_setting
 from stock_prediction.signals.generator import TradingSignal
-from stock_prediction.signals.screener import ScreenerResult, SuggestionResult
+from stock_prediction.signals.screener import ScreenerResult, ShortlistResult, SuggestionResult
 from stock_prediction.utils.constants import TICKER_TO_NAME
 from stock_prediction.utils.logging import get_logger
 
@@ -235,6 +235,78 @@ class ReportFormatter:
             f"Screened {result.total_screened} stocks"
             + (f" | {result.news_articles_scanned} news articles scanned"
                if result.news_articles_scanned else "")
+        )
+
+    def display_shortlist(self, result: ShortlistResult) -> None:
+        """Display shortlist results with buy, short, and trending sections."""
+        self.console.print(
+            Panel("Stock Shortlist", style="bold blue")
+        )
+
+        # --- Buy Candidates ---
+        if result.buy_candidates:
+            buy_table = Table(title="Buy Candidates", show_lines=True, title_style="bold green")
+            self._add_suggestion_columns(buy_table)
+            for s in result.buy_candidates:
+                self._add_suggestion_row(buy_table, s)
+            self.console.print(buy_table)
+        else:
+            self.console.print("[yellow]No buy candidates found.[/]")
+
+        # --- Short Candidates ---
+        if result.short_candidates:
+            short_table = Table(title="Short Candidates", show_lines=True, title_style="bold red")
+            self._add_suggestion_columns(short_table)
+            for s in result.short_candidates:
+                self._add_suggestion_row(short_table, s)
+            self.console.print(short_table)
+        else:
+            self.console.print("[yellow]No short candidates found.[/]")
+
+        # --- Trending from News ---
+        if result.trending:
+            trend_table = Table(title="Trending from News", show_lines=True, title_style="bold yellow")
+            self._add_suggestion_columns(trend_table)
+            for s in result.trending:
+                self._add_suggestion_row(trend_table, s)
+            self.console.print(trend_table)
+        else:
+            self.console.print("[dim]No trending stocks from news.[/]")
+
+        self.console.print(
+            f"Screened {result.total_screened} stocks"
+            + (f" | {result.news_articles_scanned} news articles scanned"
+               if result.news_articles_scanned else "")
+        )
+
+    def _add_suggestion_columns(self, table: Table) -> None:
+        """Add standard suggestion columns to a table."""
+        table.add_column("Rank", justify="right", width=5)
+        table.add_column("Symbol", style="cyan", width=14)
+        table.add_column("Name", width=22)
+        table.add_column("Price", justify="right", width=10)
+        table.add_column("1W Ret", justify="right", width=9)
+        table.add_column("1M Ret", justify="right", width=9)
+        table.add_column("RSI", justify="right", width=6)
+        table.add_column("News", justify="right", width=5)
+        table.add_column("Score", justify="right", width=7)
+        table.add_column("Reasons", width=38)
+
+    def _add_suggestion_row(self, table: Table, s) -> None:
+        """Add a suggestion row to a table."""
+        w_color = "green" if s.return_1w >= 0 else "red"
+        m_color = "green" if s.return_1m >= 0 else "red"
+        table.add_row(
+            str(s.rank),
+            s.symbol,
+            s.name[:22],
+            f"{s.price:.2f}",
+            Text(f"{s.return_1w:+.1f}%", style=w_color),
+            Text(f"{s.return_1m:+.1f}%", style=m_color),
+            f"{s.rsi:.0f}",
+            str(s.news_mentions),
+            f"{s.score:.1f}",
+            "; ".join(s.reasons),
         )
 
     def display_stock_analysis(
