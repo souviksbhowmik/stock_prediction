@@ -260,6 +260,27 @@ def suggest(count: int, no_news: bool):
     reporter.display_suggestions(result)
 
 
+@cli.command()
+@click.option("--count", "-n", default=5, help="Number of buy/short candidates")
+@click.option("--no-news", is_flag=True, help="Skip news-driven discovery")
+@click.option("--no-llm", is_flag=True, help="Skip LLM news discovery")
+def shortlist(count: int, no_news: bool, no_llm: bool):
+    """Shortlist stocks for buying, shorting, and trending from news."""
+    from stock_prediction.signals.screener import StockScreener
+    from stock_prediction.signals.report import ReportFormatter
+
+    use_news = not no_news
+    use_llm = not no_llm
+    mode = "technical-only" if no_news else ("technical + news" if no_llm else "technical + news + LLM")
+    console.print(f"Shortlisting top {count} buy/short candidates ({mode})...")
+
+    screener = StockScreener()
+    result = screener.shortlist(count=count, use_news=use_news, use_llm=use_llm)
+
+    reporter = ReportFormatter()
+    reporter.display_shortlist(result)
+
+
 @cli.command("fetch-data")
 @click.option("--symbols", "-s", default=None, help="Comma-separated stock symbols")
 @click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
