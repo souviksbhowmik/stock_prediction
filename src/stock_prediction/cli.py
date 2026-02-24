@@ -434,5 +434,143 @@ def test_calculate_gain(export: bool):
         console.print(f"[green]Report exported to {path}[/]")
 
 
+@cli.command()
+@click.argument("query")
+def lookup(query: str):
+    """Look up trading signal by company name or partial name.
+
+    QUERY can be any part of a company name, ticker, or alias
+    e.g. "tata", "bank", "infosys", "reliance"
+    """
+    from stock_prediction.models.trainer import ModelTrainer
+    from stock_prediction.features.pipeline import FeaturePipeline
+    from stock_prediction.signals.generator import SignalGenerator
+    from stock_prediction.utils.constants import COMPANY_ALIASES, TICKER_TO_NAME
+    from rich.table import Table
+    from rich.text import Text
+    import numpy as np
+
+    q = query.strip().lower()
+
+    # --- Match tickers ---
+    matched: dict[str, str] = {}  # ticker -> company name
+
+    # 1. Substring match in alias keys
+    for alias, ticker in COMPANY_ALIASES.items():
+        if q in alias:
+            matched[ticker] = TICKER_TO_NAME.get(ticker, ticker)
+
+    # 2. Substring match in canonical company names
+    for ticker, name in TICKER_TO_NAME.items():
+        if q in name.lower():
+            matched[ticker] = name
+
+    # 3. Substring match in ticker symbol itself (without .NS)
+    for ticker in TICKER_TO_NAME:
+        if q in ticker.lower().replace(".ns", ""):
+            matched[ticker] = TICKER_TO_NAME[ticker]
+
+    if not matched:
+        console.print(f"[yellow]No companies found matching '{query}'.[/]")
+        console.print("Try a broader term, e.g. 'tata', 'bank', 'pharma'")
+        return
+
+    console.print(f"\nFound [bold]{len(matched)}[/] match(es) for '[cyan]{query}[/]':\n")
+
+    # --- Fetch signals ---
+    SIGNAL_COLORS = {
+        "STRONG BUY": "bold green",
+        "BUY": "green",
+        "HOLD": "yellow",
+        "SELL": "red",
+        "STRONG SELL": "bold red",
+    }
+
+    trainer = ModelTrainer()
+    signal_gen = SignalGenerator()
+
+    table = Table(title=f"Signal Lookup — '{query}'", show_lines=True)
+    table.add_column("Symbol", style="cyan", width=16)
+    table.add_column("Company", width=28)
+    table.add_column("Signal", width=14)
+    table.add_column("Confidence", justify="right", width=11)
+    table.add_column("BUY %", justify="right", width=7)
+    table.add_column("HOLD %", justify="right", width=7)
+    table.add_column("SELL %", justify="right", width=7)
+    table.add_column("Note", width=22)
+
+    csv_rows = []
+    for symbol, name in sorted(matched.items()):
+        try:
+            ensemble, scaler, seq_scaler, model_age_days = trainer.load_models(symbol)
+            pipeline = FeaturePipeline(use_news=False, use_llm=False)
+            df = pipeline.build_features(symbol)
+
+            if df.empty or len(df) < pipeline.sequence_length:
+                raise ValueError("Insufficient feature data")
+
+            label_cols = ["return_1d", "return_5d", "signal"]
+            feature_cols = [c for c in df.columns if c not in label_cols]
+            features = df[feature_cols].values
+            seq_len = pipeline.sequence_length
+
+            latest_seq = features[-seq_len:]
+            latest_tab = features[-1]
+            n_feat = latest_seq.shape[1]
+
+            latest_seq_scaled = seq_scaler.transform(
+                latest_seq.reshape(-1, n_feat)
+            ).reshape(1, seq_len, n_feat)
+            latest_tab_scaled = scaler.transform(latest_tab.reshape(1, -1))
+
+            prediction = ensemble.predict_single(
+                latest_seq_scaled.astype(np.float32),
+                latest_tab_scaled.astype(np.float32),
+            )
+
+            tech_cols = ["RSI", "MACD_Histogram", "Price_SMA50_Ratio"]
+            tech_data = {c: float(df[c].iloc[-1]) for c in tech_cols if c in df.columns}
+
+            sig = signal_gen.generate(symbol, prediction, tech_data)
+            color = SIGNAL_COLORS.get(sig.signal, "white")
+            note = f"Model age: {model_age_days}d" if model_age_days else ""
+
+            table.add_row(
+                symbol, name[:28],
+                Text(sig.signal, style=color),
+                f"{sig.confidence:.1%}",
+                f"{sig.probabilities.get('BUY', 0):.0%}",
+                f"{sig.probabilities.get('HOLD', 0):.0%}",
+                f"{sig.probabilities.get('SELL', 0):.0%}",
+                note,
+            )
+            csv_rows.append([
+                symbol, name, sig.signal, f"{sig.confidence:.1%}",
+                f"{sig.probabilities.get('BUY', 0):.0%}",
+                f"{sig.probabilities.get('HOLD', 0):.0%}",
+                f"{sig.probabilities.get('SELL', 0):.0%}",
+                note,
+            ])
+
+        except FileNotFoundError:
+            table.add_row(symbol, name[:28], Text("N/A", style="dim"), "", "", "", "", "No trained model")
+            csv_rows.append([symbol, name, "N/A", "", "", "", "", "No trained model"])
+        except Exception as e:
+            table.add_row(symbol, name[:28], Text("ERROR", style="red"), "", "", "", "", str(e)[:22])
+            csv_rows.append([symbol, name, "ERROR", "", "", "", "", str(e)])
+
+    console.print(table)
+
+    # Save CSV
+    reports_dir = Path("data/reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    lookup_path = reports_dir / "lookup.csv"
+    with open(lookup_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Symbol", "Company", "Signal", "Confidence", "BUY %", "HOLD %", "SELL %", "Note"])
+        writer.writerows(csv_rows)
+    console.print(f"[dim]Saved: {lookup_path}[/dim]")
+
+
 if __name__ == "__main__":
     cli()
