@@ -86,7 +86,7 @@ SIGNAL_BG: dict[str, str] = {
 }
 
 PAGES = [
-    "📊 Suggest",
+    "📊 Suggest (deprecated)",
     "📋 Shortlist",
     "🔍 Lookup",
     "📥 Fetch Data",
@@ -1254,7 +1254,7 @@ def page_gain_report() -> None:
 
 # ─── Router ───────────────────────────────────────────────────────────────────
 PAGE_MAP = {
-    "📊 Suggest":    page_suggest,
+    "📊 Suggest (deprecated)": page_suggest,
     "📋 Shortlist":  page_shortlist,
     "🔍 Lookup":     page_lookup,
     "📥 Fetch Data": page_fetch_data,
