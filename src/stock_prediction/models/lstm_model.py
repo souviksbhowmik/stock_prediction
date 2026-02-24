@@ -43,15 +43,25 @@ class StockLSTM(nn.Module):
 class LSTMPredictor:
     """Wrapper for training and prediction with StockLSTM."""
 
-    def __init__(self, input_size: int):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int | None = None,
+        num_layers: int | None = None,
+        dropout: float | None = None,
+        learning_rate: float | None = None,
+        epochs: int | None = None,
+        batch_size: int | None = None,
+        patience: int | None = None,
+    ):
         self.input_size = input_size
-        self.hidden_size = get_setting("models", "lstm", "hidden_size", default=128)
-        self.num_layers = get_setting("models", "lstm", "num_layers", default=2)
-        self.dropout = get_setting("models", "lstm", "dropout", default=0.3)
-        self.lr = get_setting("models", "lstm", "learning_rate", default=0.001)
-        self.epochs = get_setting("models", "lstm", "epochs", default=50)
-        self.batch_size = get_setting("models", "lstm", "batch_size", default=32)
-        self.patience = get_setting("models", "lstm", "patience", default=10)
+        self.hidden_size = hidden_size if hidden_size is not None else get_setting("models", "lstm", "hidden_size", default=128)
+        self.num_layers = num_layers if num_layers is not None else get_setting("models", "lstm", "num_layers", default=2)
+        self.dropout = dropout if dropout is not None else get_setting("models", "lstm", "dropout", default=0.3)
+        self.lr = learning_rate if learning_rate is not None else get_setting("models", "lstm", "learning_rate", default=0.001)
+        self.epochs = epochs if epochs is not None else get_setting("models", "lstm", "epochs", default=50)
+        self.batch_size = batch_size if batch_size is not None else get_setting("models", "lstm", "batch_size", default=32)
+        self.patience = patience if patience is not None else get_setting("models", "lstm", "patience", default=10)
 
         self.device = self._get_device()
         self.model = StockLSTM(
@@ -86,10 +96,11 @@ class LSTMPredictor:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
 
-        history = {"train_loss": [], "val_loss": []}
+        history: dict[str, list[float] | int] = {"train_loss": [], "val_loss": []}
         best_val_loss = float("inf")
         patience_counter = 0
         best_state = None
+        best_epoch = 0
 
         for epoch in range(self.epochs):
             epoch_loss = 0.0
@@ -102,17 +113,18 @@ class LSTMPredictor:
                 epoch_loss += loss.item()
 
             avg_loss = epoch_loss / len(loader)
-            history["train_loss"].append(avg_loss)
+            history["train_loss"].append(avg_loss)  # type: ignore[union-attr]
 
             # Validation
             if X_val is not None and y_val is not None:
                 val_loss = self._evaluate(X_val, y_val, criterion)
-                history["val_loss"].append(val_loss)
+                history["val_loss"].append(val_loss)  # type: ignore[union-attr]
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
                     best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                    best_epoch = epoch + 1
                 else:
                     patience_counter += 1
 
@@ -128,6 +140,8 @@ class LSTMPredictor:
             else:
                 if (epoch + 1) % 10 == 0:
                     logger.info(f"Epoch {epoch + 1}/{self.epochs} - loss: {avg_loss:.4f}")
+
+        history["best_epoch"] = best_epoch if best_epoch > 0 else (epoch + 1)
 
         if best_state is not None:
             self.model.load_state_dict(best_state)

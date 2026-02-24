@@ -11,19 +11,31 @@ from stock_prediction.utils.logging import get_logger
 
 logger = get_logger("models.xgboost")
 
+_UNSET = object()  # sentinel to distinguish "not provided" from explicit None
+
 
 class XGBoostPredictor:
     """XGBoost classifier for stock signal prediction."""
 
-    def __init__(self):
-        self.n_estimators = get_setting("models", "xgboost", "n_estimators", default=500)
-        self.max_depth = get_setting("models", "xgboost", "max_depth", default=6)
-        self.learning_rate = get_setting("models", "xgboost", "learning_rate", default=0.05)
-        self.early_stopping_rounds = get_setting(
-            "models", "xgboost", "early_stopping_rounds", default=20
+    def __init__(
+        self,
+        n_estimators: int | None = None,
+        max_depth: int | None = None,
+        learning_rate: float | None = None,
+        early_stopping_rounds: int | None = _UNSET,  # type: ignore[assignment]
+        subsample: float | None = None,
+        colsample_bytree: float | None = None,
+    ):
+        self.n_estimators = n_estimators if n_estimators is not None else get_setting("models", "xgboost", "n_estimators", default=500)
+        self.max_depth = max_depth if max_depth is not None else get_setting("models", "xgboost", "max_depth", default=6)
+        self.learning_rate = learning_rate if learning_rate is not None else get_setting("models", "xgboost", "learning_rate", default=0.05)
+        self.early_stopping_rounds = (
+            get_setting("models", "xgboost", "early_stopping_rounds", default=20)
+            if early_stopping_rounds is _UNSET
+            else early_stopping_rounds
         )
-        self.subsample = get_setting("models", "xgboost", "subsample", default=0.8)
-        self.colsample_bytree = get_setting("models", "xgboost", "colsample_bytree", default=0.8)
+        self.subsample = subsample if subsample is not None else get_setting("models", "xgboost", "subsample", default=0.8)
+        self.colsample_bytree = colsample_bytree if colsample_bytree is not None else get_setting("models", "xgboost", "colsample_bytree", default=0.8)
 
         self.model = xgb.XGBClassifier(
             n_estimators=self.n_estimators,

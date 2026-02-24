@@ -86,18 +86,29 @@ class FeaturePipeline:
         return df
 
     def _add_labels(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add return and signal labels."""
+        """Add return and signal labels.
+
+        The signal is based on the configured prediction_horizon (days ahead).
+        return_1d and return_5d are always computed so they are available as
+        reference columns but are excluded from the feature matrix.
+        """
         buy_thresh = get_setting("signals", "buy_return_threshold", default=0.01)
         sell_thresh = get_setting("signals", "sell_return_threshold", default=-0.01)
+        horizon = int(get_setting("features", "prediction_horizon", default=1))
 
         df = df.copy()
         df["return_1d"] = df["Close"].pct_change(1).shift(-1)
         df["return_5d"] = df["Close"].pct_change(5).shift(-5)
 
-        # Signal: 0=SELL, 1=HOLD, 2=BUY
+        # Compute the horizon return if it isn't one of the two above
+        horizon_col = f"return_{horizon}d"
+        if horizon_col not in df.columns:
+            df[horizon_col] = df["Close"].pct_change(horizon).shift(-horizon)
+
+        # Signal: 0=SELL, 1=HOLD, 2=BUY  — based on the configured horizon
         conditions = [
-            df["return_1d"] <= sell_thresh,
-            df["return_1d"] >= buy_thresh,
+            df[horizon_col] <= sell_thresh,
+            df[horizon_col] >= buy_thresh,
         ]
         choices = [0, 2]
         df["signal"] = np.select(conditions, choices, default=1)
@@ -131,8 +142,9 @@ class FeaturePipeline:
                 f"use an earlier --start-date (default 2020-01-01 gives ~1200 rows)"
             )
 
-        # Separate features and labels
-        label_cols = ["return_1d", "return_5d", "signal"]
+        # Separate features and labels — exclude all future-looking return columns
+        horizon = int(get_setting("features", "prediction_horizon", default=1))
+        label_cols = {"return_1d", "return_5d", f"return_{horizon}d", "signal"}
         feature_cols = [c for c in df.columns if c not in label_cols]
         feature_names = feature_cols
 
