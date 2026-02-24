@@ -98,13 +98,27 @@ class ModelTrainer:
 
         # ── 3. Hyperparameter tuning on val split ─────────────────────────
         logger.info(f"Tuning XGBoost hyperparameters for {symbol}...")
-        best_xgb_params, best_n_estimators = self._tune_xgboost(
+        best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
             X_tab_train_s, y_train, X_tab_val_s, y_val
         )
 
         logger.info(f"Tuning LSTM hyperparameters for {symbol}...")
-        best_lstm_params, best_lstm_epochs = self._tune_lstm(
+        best_lstm_params, best_lstm_epochs, lstm_val_acc = self._tune_lstm(
             X_seq_train_s, y_train, X_seq_val_s, y_val, n_features
+        )
+
+        # Derive per-stock dynamic ensemble weights from individual val accuracies
+        total_acc = lstm_val_acc + xgb_val_acc
+        if total_acc > 0:
+            lstm_weight = lstm_val_acc / total_acc
+            xgb_weight = xgb_val_acc / total_acc
+        else:
+            lstm_weight = get_setting("models", "ensemble", "lstm_weight", default=0.4)
+            xgb_weight = get_setting("models", "ensemble", "xgboost_weight", default=0.6)
+        logger.info(
+            f"Dynamic ensemble weights for {symbol}: "
+            f"LSTM={lstm_weight:.3f} (acc={lstm_val_acc:.4f}), "
+            f"XGB={xgb_weight:.3f} (acc={xgb_val_acc:.4f})"
         )
 
         # ── 4. Compute ensemble val accuracy with the best individual models
@@ -114,7 +128,7 @@ class ModelTrainer:
         lstm_val = LSTMPredictor(input_size=n_features, **best_lstm_params, epochs=best_lstm_epochs)
         lstm_val.train(X_seq_train_s, y_train)
 
-        ensemble_val = EnsembleModel(lstm_val, xgb_val)
+        ensemble_val = EnsembleModel(lstm_val, xgb_val, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
         val_preds = ensemble_val.predict(X_seq_val_s, X_tab_val_s)
         val_accuracy = float(np.mean([p.signal_idx for p in val_preds] == y_val))
         logger.info(f"Best ensemble val accuracy for {symbol}: {val_accuracy:.4f}")
@@ -148,11 +162,12 @@ class ModelTrainer:
         )
         lstm_final.train(X_seq_full_s, labels)
 
-        ensemble = EnsembleModel(lstm_final, xgb_final)
+        ensemble = EnsembleModel(lstm_final, xgb_final, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
 
         # ── 6. Save full-data models and scalers ──────────────────────────
         self._save_models(
-            symbol, lstm_final, xgb_final, full_scaler, full_seq_scaler, feature_names
+            symbol, lstm_final, xgb_final, full_scaler, full_seq_scaler,
+            feature_names, lstm_weight, xgb_weight,
         )
 
         return ensemble, val_accuracy
@@ -165,8 +180,8 @@ class ModelTrainer:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
-    ) -> tuple[dict, int]:
-        """Grid search over _XGB_PARAM_GRID; returns (best_params, best_n_estimators)."""
+    ) -> tuple[dict, int, float]:
+        """Grid search over _XGB_PARAM_GRID; returns (best_params, best_n_estimators, best_val_acc)."""
         best_acc = -1.0
         best_params: dict = {}
         best_n_est = 500
@@ -185,7 +200,7 @@ class ModelTrainer:
         logger.info(
             f"Best XGB: {best_params}, n_estimators={best_n_est}, val_acc={best_acc:.4f}"
         )
-        return best_params, best_n_est
+        return best_params, best_n_est, best_acc
 
     def _tune_lstm(
         self,
@@ -194,8 +209,8 @@ class ModelTrainer:
         X_seq_val: np.ndarray,
         y_val: np.ndarray,
         n_features: int,
-    ) -> tuple[dict, int]:
-        """Grid search over _LSTM_PARAM_GRID; returns (best_params, best_epochs)."""
+    ) -> tuple[dict, int, float]:
+        """Grid search over _LSTM_PARAM_GRID; returns (best_params, best_epochs, best_val_acc)."""
         best_acc = -1.0
         best_params: dict = {}
         best_epochs = get_setting("models", "lstm", "epochs", default=50)
@@ -214,7 +229,7 @@ class ModelTrainer:
         logger.info(
             f"Best LSTM: {best_params}, epochs={best_epochs}, val_acc={best_acc:.4f}"
         )
-        return best_params, best_epochs
+        return best_params, best_epochs, best_acc
 
     def _cfg_xgb_n_estimators(self) -> int:
         return int(get_setting("models", "xgboost", "n_estimators", default=500))
@@ -290,7 +305,11 @@ class ModelTrainer:
         xgb = XGBoostPredictor()
         xgb.load(xgb_path)
 
-        ensemble = EnsembleModel(lstm, xgb)
+        # Restore per-stock dynamic weights; fall back to config if loading an
+        # older model that was saved before dynamic weighting was introduced.
+        lstm_weight = meta.get("lstm_weight")
+        xgb_weight = meta.get("xgb_weight")
+        ensemble = EnsembleModel(lstm, xgb, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
 
         model_age_days = None
         trained_at = meta.get("trained_at")
@@ -308,6 +327,8 @@ class ModelTrainer:
         scaler: StandardScaler,
         seq_scaler: StandardScaler,
         feature_names: list[str],
+        lstm_weight: float,
+        xgb_weight: float,
     ) -> None:
         model_dir = self.save_dir / symbol.replace(".", "_")
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +340,8 @@ class ModelTrainer:
             "seq_scaler": seq_scaler,
             "feature_names": feature_names,
             "input_size": lstm.input_size,
+            "lstm_weight": lstm_weight,
+            "xgb_weight": xgb_weight,
             "trained_at": datetime.now().isoformat(),
         }, model_dir / "meta.joblib")
 

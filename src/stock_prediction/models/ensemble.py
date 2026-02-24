@@ -29,11 +29,17 @@ class EnsemblePrediction:
 class EnsembleModel:
     """Weighted average ensemble of LSTM and XGBoost."""
 
-    def __init__(self, lstm: LSTMPredictor, xgboost: XGBoostPredictor):
+    def __init__(
+        self,
+        lstm: LSTMPredictor,
+        xgboost: XGBoostPredictor,
+        lstm_weight: float | None = None,
+        xgboost_weight: float | None = None,
+    ):
         self.lstm = lstm
         self.xgboost = xgboost
-        self.lstm_weight = get_setting("models", "ensemble", "lstm_weight", default=0.4)
-        self.xgboost_weight = get_setting("models", "ensemble", "xgboost_weight", default=0.6)
+        self.lstm_weight = lstm_weight if lstm_weight is not None else get_setting("models", "ensemble", "lstm_weight", default=0.4)
+        self.xgboost_weight = xgboost_weight if xgboost_weight is not None else get_setting("models", "ensemble", "xgboost_weight", default=0.6)
 
     def predict(
         self, X_seq: np.ndarray, X_tab: np.ndarray
