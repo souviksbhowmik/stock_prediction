@@ -186,5 +186,16 @@ class LSTMPredictor:
 
     def load(self, path: str | Path) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        # Rebuild model with the saved architecture before loading weights.
+        # This handles cases where tuned hyperparams differ from config defaults.
+        self.hidden_size = checkpoint.get("hidden_size", self.hidden_size)
+        self.num_layers = checkpoint.get("num_layers", self.num_layers)
+        self.dropout = checkpoint.get("dropout", self.dropout)
+        self.model = StockLSTM(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+        ).to(self.device)
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.to(self.device)
