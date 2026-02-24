@@ -63,10 +63,10 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         close=df["Close"], volume=df["Volume"]
     ).on_balance_volume()
 
-    # VWAP approximation (intraday is ideal, but daily approximation)
-    df["VWAP"] = (df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3).cumsum() / df[
-        "Volume"
-    ].cumsum()
+    # VWAP — rolling 20-day typical-price weighted average (not cumulative)
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+    tp_vol = typical_price * df["Volume"]
+    df["VWAP"] = tp_vol.rolling(window=20).sum() / df["Volume"].rolling(window=20).sum()
 
     # ATR
     atr_period = get_setting("features", "technical", "atr_period", default=14)
@@ -82,12 +82,33 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Stoch_K"] = stoch.stoch()
     df["Stoch_D"] = stoch.stoch_signal()
 
-    # Derived features
+    # Derived ratio features
     df["SMA_20_50_Cross"] = (df["SMA_20"] > df["SMA_50"]).astype(int)
     df["Price_SMA20_Ratio"] = df["Close"] / df["SMA_20"]
     df["Price_SMA50_Ratio"] = df["Close"] / df["SMA_50"]
     df["Volume_SMA20"] = df["Volume"].rolling(window=20).mean()
     df["Volume_Ratio"] = df["Volume"] / df["Volume_SMA20"]
+
+    # ── Lag / rate-of-change features ────────────────────────────────────
+    # These tell the model HOW FAST indicators are moving, not just their level.
+
+    # RSI momentum
+    df["RSI_Change_1d"] = df["RSI"].diff(1)
+    df["RSI_Change_3d"] = df["RSI"].diff(3)
+
+    # MACD histogram momentum
+    df["MACD_Hist_Change_1d"] = df["MACD_Histogram"].diff(1)
+
+    # Price momentum (backward-looking % returns as features)
+    df["Price_Momentum_3d"]  = df["Close"].pct_change(3)
+    df["Price_Momentum_5d"]  = df["Close"].pct_change(5)
+    df["Price_Momentum_10d"] = df["Close"].pct_change(10)
+
+    # Volume momentum
+    df["Volume_Change_3d"] = df["Volume"].pct_change(3)
+
+    # Stochastic momentum
+    df["Stoch_K_Change_1d"] = df["Stoch_K"].diff(1)
 
     logger.info(f"Added {len(df.columns) - 5} technical indicators")
     return df

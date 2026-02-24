@@ -58,8 +58,14 @@ class XGBoostPredictor:
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
         feature_names: list[str] | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> dict:
-        """Train the XGBoost model."""
+        """Train the XGBoost model.
+
+        Args:
+            sample_weight: Per-sample weights to counter class imbalance.
+                           Pass None to use uniform weights.
+        """
         if feature_names:
             self.feature_names = feature_names
 
@@ -67,7 +73,12 @@ class XGBoostPredictor:
         if X_val is not None and y_val is not None:
             eval_set.append((X_val, y_val))
 
-        self.model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
+        self.model.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+            eval_set=eval_set,
+            verbose=False,
+        )
 
         # Get best iteration info
         results = self.model.evals_result()

@@ -84,8 +84,14 @@ class LSTMPredictor:
         y_train: np.ndarray,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
-    ) -> dict[str, list[float]]:
-        """Train the LSTM model."""
+        class_weights: np.ndarray | None = None,
+    ) -> dict[str, list[float] | int]:
+        """Train the LSTM model.
+
+        Args:
+            class_weights: Per-class weights shape (num_classes,) to counter
+                           class imbalance. Pass None to use uniform weights.
+        """
         self.model.train()
         X_t = torch.FloatTensor(X_train).to(self.device)
         y_t = torch.LongTensor(y_train).to(self.device)
@@ -94,7 +100,11 @@ class LSTMPredictor:
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion = nn.CrossEntropyLoss()
+        if class_weights is not None:
+            weight_tensor = torch.FloatTensor(class_weights).to(self.device)
+            criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        else:
+            criterion = nn.CrossEntropyLoss()
 
         history: dict[str, list[float] | int] = {"train_loss": [], "val_loss": []}
         best_val_loss = float("inf")

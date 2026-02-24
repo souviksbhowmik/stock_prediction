@@ -6,6 +6,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
 
 from stock_prediction.config import get_setting
 from stock_prediction.features.pipeline import FeaturePipeline
@@ -22,18 +23,22 @@ logger = get_logger("models.trainer")
 # colsample_bytree remain at their config defaults.
 # ---------------------------------------------------------------------------
 _XGB_PARAM_GRID: list[dict] = [
+    {"max_depth": 3, "learning_rate": 0.10},
     {"max_depth": 4, "learning_rate": 0.05},
     {"max_depth": 4, "learning_rate": 0.10},
     {"max_depth": 6, "learning_rate": 0.05},
     {"max_depth": 6, "learning_rate": 0.10},
+    {"max_depth": 8, "learning_rate": 0.05},
 ]
 
-# LSTM: tune hidden_size and dropout; learning_rate and num_layers stay fixed.
+# LSTM: tune hidden_size, dropout, and learning_rate.
 _LSTM_PARAM_GRID: list[dict] = [
     {"hidden_size": 64,  "dropout": 0.2, "learning_rate": 0.001},
     {"hidden_size": 64,  "dropout": 0.3, "learning_rate": 0.001},
     {"hidden_size": 128, "dropout": 0.2, "learning_rate": 0.001},
     {"hidden_size": 128, "dropout": 0.3, "learning_rate": 0.001},
+    {"hidden_size": 128, "dropout": 0.2, "learning_rate": 0.0005},
+    {"hidden_size": 256, "dropout": 0.3, "learning_rate": 0.001},
 ]
 
 
@@ -96,15 +101,26 @@ class ModelTrainer:
             X_seq_val.reshape(-1, n_features)
         ).reshape(len(X_seq_val), seq_len, n_features)
 
-        # ── 3. Hyperparameter tuning on val split ─────────────────────────
+        # ── 3. Compute class weights from training split ───────────────────
+        classes = np.array([0, 1, 2])
+        class_weights = compute_class_weight("balanced", classes=classes, y=y_train)
+        sample_weights_train = compute_sample_weight("balanced", y=y_train)
+        logger.info(
+            f"Class weights for {symbol} (SELL/HOLD/BUY): "
+            + "/".join(f"{w:.2f}" for w in class_weights)
+        )
+
+        # ── 4. Hyperparameter tuning on val split ─────────────────────────
         logger.info(f"Tuning XGBoost hyperparameters for {symbol}...")
         best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
-            X_tab_train_s, y_train, X_tab_val_s, y_val
+            X_tab_train_s, y_train, X_tab_val_s, y_val,
+            sample_weight=sample_weights_train,
         )
 
         logger.info(f"Tuning LSTM hyperparameters for {symbol}...")
         best_lstm_params, best_lstm_epochs, lstm_val_acc = self._tune_lstm(
-            X_seq_train_s, y_train, X_seq_val_s, y_val, n_features
+            X_seq_train_s, y_train, X_seq_val_s, y_val, n_features,
+            class_weights=class_weights,
         )
 
         # Derive per-stock dynamic ensemble weights from individual val accuracies
@@ -121,12 +137,13 @@ class ModelTrainer:
             f"XGB={xgb_weight:.3f} (acc={xgb_val_acc:.4f})"
         )
 
-        # ── 4. Compute ensemble val accuracy with the best individual models
+        # ── 5. Compute ensemble val accuracy with the best individual models
         xgb_val = XGBoostPredictor(**best_xgb_params, n_estimators=best_n_estimators, early_stopping_rounds=None)
-        xgb_val.train(X_tab_train_s, y_train, feature_names=feature_names)
+        xgb_val.train(X_tab_train_s, y_train, feature_names=feature_names,
+                      sample_weight=sample_weights_train)
 
         lstm_val = LSTMPredictor(input_size=n_features, **best_lstm_params, epochs=best_lstm_epochs)
-        lstm_val.train(X_seq_train_s, y_train)
+        lstm_val.train(X_seq_train_s, y_train, class_weights=class_weights)
 
         ensemble_val = EnsembleModel(lstm_val, xgb_val, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
         val_preds = ensemble_val.predict(X_seq_val_s, X_tab_val_s)
@@ -145,6 +162,10 @@ class ModelTrainer:
             sequences.reshape(-1, n_features)
         ).reshape(n_samples, seq_len, n_features)
 
+        # Recompute class weights on the full dataset for final models
+        class_weights_full = compute_class_weight("balanced", classes=classes, y=labels)
+        sample_weights_full = compute_sample_weight("balanced", y=labels)
+
         # XGBoost: fixed n_estimators (no early stopping — no held-out set)
         # Scale up proportionally since full data ~1/train_split times larger.
         n_est_full = max(best_n_estimators, int(best_n_estimators / self.train_split))
@@ -153,14 +174,15 @@ class ModelTrainer:
             n_estimators=n_est_full,
             early_stopping_rounds=None,
         )
-        xgb_final.train(X_tab_full_s, labels, feature_names=feature_names)
+        xgb_final.train(X_tab_full_s, labels, feature_names=feature_names,
+                        sample_weight=sample_weights_full)
 
         # LSTM: fixed epoch count (no early stopping)
         epochs_full = max(best_lstm_epochs, int(best_lstm_epochs / self.train_split))
         lstm_final = LSTMPredictor(
             input_size=n_features, **best_lstm_params, epochs=epochs_full
         )
-        lstm_final.train(X_seq_full_s, labels)
+        lstm_final.train(X_seq_full_s, labels, class_weights=class_weights_full)
 
         ensemble = EnsembleModel(lstm_final, xgb_final, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
 
@@ -180,6 +202,7 @@ class ModelTrainer:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
+        sample_weight: np.ndarray | None = None,
     ) -> tuple[dict, int, float]:
         """Grid search over _XGB_PARAM_GRID; returns (best_params, best_n_estimators, best_val_acc)."""
         best_acc = -1.0
@@ -188,7 +211,7 @@ class ModelTrainer:
 
         for params in _XGB_PARAM_GRID:
             model = XGBoostPredictor(**params)
-            model.train(X_train, y_train, X_val, y_val)
+            model.train(X_train, y_train, X_val, y_val, sample_weight=sample_weight)
             acc = float(np.mean(model.predict(X_val) == y_val))
             n_est = getattr(model.model, "best_iteration", self._cfg_xgb_n_estimators()) + 1
             logger.info(f"  XGB {params} → val_acc={acc:.4f}, best_iter={n_est}")
@@ -209,6 +232,7 @@ class ModelTrainer:
         X_seq_val: np.ndarray,
         y_val: np.ndarray,
         n_features: int,
+        class_weights: np.ndarray | None = None,
     ) -> tuple[dict, int, float]:
         """Grid search over _LSTM_PARAM_GRID; returns (best_params, best_epochs, best_val_acc)."""
         best_acc = -1.0
@@ -217,7 +241,8 @@ class ModelTrainer:
 
         for params in _LSTM_PARAM_GRID:
             model = LSTMPredictor(input_size=n_features, **params)
-            history = model.train(X_seq_train, y_train, X_seq_val, y_val)
+            history = model.train(X_seq_train, y_train, X_seq_val, y_val,
+                                  class_weights=class_weights)
             acc = float(np.mean(model.predict(X_seq_val) == y_val))
             epoch = int(history.get("best_epoch", model.epochs))  # type: ignore[arg-type]
             logger.info(f"  LSTM {params} → val_acc={acc:.4f}, best_epoch={epoch}")

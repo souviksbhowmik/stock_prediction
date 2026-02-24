@@ -18,6 +18,22 @@ from stock_prediction.utils.logging import get_logger
 
 logger = get_logger("features.pipeline")
 
+# Per-horizon buy/sell thresholds derived from √t volatility scaling
+# (base ±1% at horizon=1, scaled by √horizon for longer horizons).
+# Restricted to horizons 1-10; values are (buy_thresh, sell_thresh).
+HORIZON_THRESHOLDS: dict[int, tuple[float, float]] = {
+    1:  ( 0.010, -0.010),
+    2:  ( 0.014, -0.014),
+    3:  ( 0.017, -0.017),
+    4:  ( 0.020, -0.020),
+    5:  ( 0.022, -0.022),
+    6:  ( 0.024, -0.024),
+    7:  ( 0.026, -0.026),
+    8:  ( 0.028, -0.028),
+    9:  ( 0.030, -0.030),
+    10: ( 0.032, -0.032),
+}
+
 
 class FeaturePipeline:
     """Build full feature matrix for model training/prediction."""
@@ -76,7 +92,10 @@ class FeaturePipeline:
             except Exception as e:
                 logger.warning(f"LLM features failed for {symbol}: {e}")
 
-        # Step 5: Create labels
+        # Step 5: Market context (NIFTY 50 relative strength)
+        df = self._add_market_context(df, start_date, end_date)
+
+        # Step 6: Create labels
         df = self._add_labels(df)
 
         # Drop rows with NaN (from indicator warmup)
@@ -85,16 +104,63 @@ class FeaturePipeline:
         logger.info(f"Built features for {symbol}: {df.shape}")
         return df
 
+    def _add_market_context(
+        self,
+        df: pd.DataFrame,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
+        """Add NIFTY 50 market context features.
+
+        Adds:
+          NIFTY_Return_1d      — NIFTY's daily % return (market direction)
+          Relative_Strength_1d — stock 1d return minus NIFTY 1d return
+          Relative_Strength_5d — stock 5d return minus NIFTY 5d return
+        """
+        try:
+            nifty_data = self.data_provider.fetch_historical("^NSEI", start_date, end_date)
+            if nifty_data.is_empty:
+                logger.warning("NIFTY data unavailable — skipping market context features")
+                return df
+
+            nifty_close = nifty_data.df[["Close"]].rename(columns={"Close": "_NIFTY"})
+            df = df.join(nifty_close, how="left")
+
+            nifty_1d = df["_NIFTY"].pct_change(1)
+            nifty_5d = df["_NIFTY"].pct_change(5)
+
+            df["NIFTY_Return_1d"]      = nifty_1d
+            df["Relative_Strength_1d"] = df["Close"].pct_change(1) - nifty_1d
+            df["Relative_Strength_5d"] = df["Close"].pct_change(5) - nifty_5d
+
+            df = df.drop(columns=["_NIFTY"])
+            logger.info("Added NIFTY market context features")
+        except Exception as e:
+            logger.warning(f"Market context features failed: {e} — continuing without them")
+
+        return df
+
     def _add_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add return and signal labels.
 
         The signal is based on the configured prediction_horizon (days ahead).
-        return_1d and return_5d are always computed so they are available as
-        reference columns but are excluded from the feature matrix.
+        Thresholds are chosen from HORIZON_THRESHOLDS (horizon 1-10) so that
+        the BUY/SELL band widens proportionally with expected volatility.
+        return_1d and return_5d are always computed as reference columns but
+        excluded from the feature matrix.
         """
-        buy_thresh = get_setting("signals", "buy_return_threshold", default=0.01)
-        sell_thresh = get_setting("signals", "sell_return_threshold", default=-0.01)
         horizon = int(get_setting("features", "prediction_horizon", default=1))
+        if horizon < 1 or horizon > 10:
+            raise ValueError(
+                f"prediction_horizon must be between 1 and 10, got {horizon}. "
+                "Update config/settings.yaml."
+            )
+
+        buy_thresh, sell_thresh = HORIZON_THRESHOLDS[horizon]
+        logger.info(
+            f"Labelling with horizon={horizon}d, "
+            f"buy>={buy_thresh:.1%}, sell<={sell_thresh:.1%}"
+        )
 
         df = df.copy()
         df["return_1d"] = df["Close"].pct_change(1).shift(-1)

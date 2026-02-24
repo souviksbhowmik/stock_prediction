@@ -43,7 +43,7 @@ features:
     atr_period: 14
     stoch_period: 14
   sequence_length: 60
-  prediction_horizon: 5  # trading days ahead to predict (e.g. 1, 5, 7, 10)
+  prediction_horizon: 5  # trading days ahead to predict; must be 1-10
 
 models:
   lstm:
@@ -72,6 +72,9 @@ signals:
   confidence_threshold: 0.6
   strong_threshold: 0.8
   short_confidence_threshold: 0.7
+  # buy/sell thresholds below are fallbacks only.
+  # The pipeline auto-selects per-horizon thresholds (sqrt volatility scaling)
+  # from HORIZON_THRESHOLDS in pipeline.py for horizons 1-10.
   buy_return_threshold: 0.01
   sell_return_threshold: -0.01
 
