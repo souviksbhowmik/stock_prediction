@@ -12,6 +12,7 @@ data/processed/
 data/news_cache/
 data/models/
 data/trades/
+data/reports/
 *.pkl
 *.joblib
 *.pt

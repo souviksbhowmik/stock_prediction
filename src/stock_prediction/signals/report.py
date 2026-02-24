@@ -40,6 +40,18 @@ class ReportFormatter:
         self.console = Console()
         self.export_dir = Path(get_setting("report", "export_dir", default="data/processed"))
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        self.reports_dir = Path("data/reports")
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_stage_csv(self, filename: str, headers: list[str], rows: list[list[str]]) -> None:
+        """Write a CSV report alongside console output (overwrites each run)."""
+        path = self.reports_dir / filename
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(rows)
+        logger.info(f"Saved stage CSV to {path}")
+        self.console.print(f"[dim]Saved: {path}[/dim]")
 
     def display_full_report(
         self,
@@ -72,6 +84,7 @@ class ReportFormatter:
         table.add_column("SELL %", justify="right", width=8)
         table.add_column("Outlook", width=30)
 
+        csv_rows = []
         for sig in signals:
             color = SIGNAL_COLORS.get(sig.signal, "white")
             name = TICKER_TO_NAME.get(sig.symbol, sig.symbol)[:22]
@@ -85,8 +98,23 @@ class ReportFormatter:
                 f"{sig.probabilities.get('SELL', 0):.0%}",
                 sig.weekly_outlook,
             )
+            csv_rows.append([
+                sig.symbol,
+                TICKER_TO_NAME.get(sig.symbol, sig.symbol),
+                sig.signal,
+                f"{sig.confidence:.1%}",
+                f"{sig.probabilities.get('BUY', 0):.0%}",
+                f"{sig.probabilities.get('HOLD', 0):.0%}",
+                f"{sig.probabilities.get('SELL', 0):.0%}",
+                sig.weekly_outlook,
+            ])
 
         self.console.print(table)
+        self._save_stage_csv(
+            "signals.csv",
+            ["Symbol", "Name", "Signal", "Confidence", "BUY %", "HOLD %", "SELL %", "Outlook"],
+            csv_rows,
+        )
 
     def _display_short_candidates(self, signals: list[TradingSignal]) -> None:
         """Display short selling candidates."""
@@ -102,6 +130,7 @@ class ReportFormatter:
         table.add_column("Confidence", justify="right", width=10)
         table.add_column("Reasons", width=30)
 
+        csv_rows = []
         for sig in shorts:
             reasons = []
             tech = sig.technical_summary
@@ -113,16 +142,30 @@ class ReportFormatter:
                 reasons.append("Below SMA50")
 
             name = TICKER_TO_NAME.get(sig.symbol, sig.symbol)[:22]
+            reasons_text = ", ".join(reasons) if reasons else "Model signal"
             table.add_row(
                 sig.symbol,
                 name,
                 Text(sig.signal, style="bold red"),
                 f"{sig.short_score:.2f}",
                 f"{sig.confidence:.1%}",
-                ", ".join(reasons) if reasons else "Model signal",
+                reasons_text,
             )
+            csv_rows.append([
+                sig.symbol,
+                TICKER_TO_NAME.get(sig.symbol, sig.symbol),
+                sig.signal,
+                f"{sig.short_score:.2f}",
+                f"{sig.confidence:.1%}",
+                reasons_text,
+            ])
 
         self.console.print(table)
+        self._save_stage_csv(
+            "short_candidates.csv",
+            ["Symbol", "Name", "Signal", "Short Score", "Confidence", "Reasons"],
+            csv_rows,
+        )
 
     def _display_top_picks(self, top_picks: list[dict]) -> None:
         """Display top picks section."""
@@ -137,17 +180,32 @@ class ReportFormatter:
         table.add_column("RSI", justify="right", width=6)
         table.add_column("Reasons", width=40)
 
+        csv_rows = []
         for pick in top_picks:
+            reasons_text = "; ".join(pick["reasons"])
             table.add_row(
                 pick["symbol"],
                 pick["name"][:22],
                 f"{pick['score']:.1f}",
                 f"{pick['price']:.2f}",
                 f"{pick['rsi']:.0f}",
-                "; ".join(pick["reasons"]),
+                reasons_text,
             )
+            csv_rows.append([
+                pick["symbol"],
+                pick["name"],
+                f"{pick['score']:.1f}",
+                f"{pick['price']:.2f}",
+                f"{pick['rsi']:.0f}",
+                reasons_text,
+            ])
 
         self.console.print(table)
+        self._save_stage_csv(
+            "top_picks.csv",
+            ["Symbol", "Name", "Score", "Price", "RSI", "Reasons"],
+            csv_rows,
+        )
 
     def _display_sector_overview(self, sector_data: dict[str, list[dict]]) -> None:
         """Display sector momentum overview."""
@@ -161,6 +219,7 @@ class ReportFormatter:
         table.add_column("1M Return", justify="right", width=10)
         table.add_column("Momentum", justify="right", width=10)
 
+        csv_rows = []
         for sector, stocks in sector_data.items():
             if stocks:
                 leader = stocks[0]
@@ -174,8 +233,20 @@ class ReportFormatter:
                     Text(f"{ret_1m:+.1f}%", style=color),
                     Text(f"{leader['momentum']:+.1f}", style=color),
                 )
+                csv_rows.append([
+                    sector.replace("_", " "),
+                    leader["name"],
+                    f"{ret_1w:+.1f}%",
+                    f"{ret_1m:+.1f}%",
+                    f"{leader['momentum']:+.1f}",
+                ])
 
         self.console.print(table)
+        self._save_stage_csv(
+            "sector_momentum.csv",
+            ["Sector", "Leader", "1W Return", "1M Return", "Momentum"],
+            csv_rows,
+        )
 
     def _display_news_alerts(self, alerts: list[dict]) -> None:
         """Display news-discovered stocks."""
@@ -187,14 +258,25 @@ class ReportFormatter:
         table.add_column("Ticker", width=14)
         table.add_column("Reason", width=45)
 
+        csv_rows = []
         for alert in alerts:
             table.add_row(
                 alert["company"],
                 alert.get("ticker", "N/A"),
                 alert.get("reason", ""),
             )
+            csv_rows.append([
+                alert["company"],
+                alert.get("ticker", "N/A"),
+                alert.get("reason", ""),
+            ])
 
         self.console.print(table)
+        self._save_stage_csv(
+            "news_alerts.csv",
+            ["Company", "Ticker", "Reason"],
+            csv_rows,
+        )
 
     def display_suggestions(self, result: SuggestionResult) -> None:
         """Display stock suggestions as a Rich table."""
@@ -214,6 +296,7 @@ class ReportFormatter:
         table.add_column("Score", justify="right", width=7)
         table.add_column("Reasons", width=38)
 
+        csv_rows = []
         for s in result.suggestions:
             w_color = "green" if s.return_1w >= 0 else "red"
             m_color = "green" if s.return_1m >= 0 else "red"
@@ -229,8 +312,19 @@ class ReportFormatter:
                 f"{s.score:.1f}",
                 "; ".join(s.reasons),
             )
+            csv_rows.append([
+                str(s.rank), s.symbol, s.name, f"{s.price:.2f}",
+                f"{s.return_1w:+.1f}%", f"{s.return_1m:+.1f}%",
+                f"{s.rsi:.0f}", str(s.news_mentions), f"{s.score:.1f}",
+                "; ".join(s.reasons),
+            ])
 
         self.console.print(table)
+        self._save_stage_csv(
+            "suggestions.csv",
+            ["Rank", "Symbol", "Name", "Price", "1W Ret", "1M Ret", "RSI", "News", "Score", "Reasons"],
+            csv_rows,
+        )
         self.console.print(
             f"Screened {result.total_screened} stocks"
             + (f" | {result.news_articles_scanned} news articles scanned"
@@ -243,12 +337,16 @@ class ReportFormatter:
             Panel("Stock Shortlist", style="bold blue")
         )
 
+        shortlist_headers = ["Category", "Rank", "Symbol", "Name", "Price", "1W Ret", "1M Ret", "RSI", "News", "Score", "Reasons"]
+        all_csv_rows: list[list[str]] = []
+
         # --- Buy Candidates ---
         if result.buy_candidates:
             buy_table = Table(title="Buy Candidates", show_lines=True, title_style="bold green")
             self._add_suggestion_columns(buy_table)
             for s in result.buy_candidates:
                 self._add_suggestion_row(buy_table, s)
+                all_csv_rows.append(["Buy"] + self._suggestion_to_csv_row(s))
             self.console.print(buy_table)
         else:
             self.console.print("[yellow]No buy candidates found.[/]")
@@ -259,6 +357,7 @@ class ReportFormatter:
             self._add_suggestion_columns(short_table)
             for s in result.short_candidates:
                 self._add_suggestion_row(short_table, s)
+                all_csv_rows.append(["Short"] + self._suggestion_to_csv_row(s))
             self.console.print(short_table)
         else:
             self.console.print("[yellow]No short candidates found.[/]")
@@ -269,9 +368,12 @@ class ReportFormatter:
             self._add_suggestion_columns(trend_table)
             for s in result.trending:
                 self._add_suggestion_row(trend_table, s)
+                all_csv_rows.append(["Trending"] + self._suggestion_to_csv_row(s))
             self.console.print(trend_table)
         else:
             self.console.print("[dim]No trending stocks from news.[/]")
+
+        self._save_stage_csv("shortlist.csv", shortlist_headers, all_csv_rows)
 
         self.console.print(
             f"Screened {result.total_screened} stocks"
@@ -309,6 +411,16 @@ class ReportFormatter:
             "; ".join(s.reasons),
         )
 
+    @staticmethod
+    def _suggestion_to_csv_row(s) -> list[str]:
+        """Convert a suggestion to a plain-text CSV row."""
+        return [
+            str(s.rank), s.symbol, s.name, f"{s.price:.2f}",
+            f"{s.return_1w:+.1f}%", f"{s.return_1m:+.1f}%",
+            f"{s.rsi:.0f}", str(s.news_mentions), f"{s.score:.1f}",
+            "; ".join(s.reasons),
+        ]
+
     def display_stock_analysis(
         self,
         signal: TradingSignal,
@@ -334,16 +446,17 @@ class ReportFormatter:
             table.add_column("Factor", width=25)
             table.add_column("Score (0-10)", justify="right", width=12)
 
+            csv_rows = []
             for key, value in llm_scores.items():
                 if key.startswith("_"):
                     continue
                 score_color = "green" if value >= 6 else "red" if value <= 4 else "yellow"
-                table.add_row(
-                    key.replace("_", " ").title(),
-                    Text(f"{value:.1f}", style=score_color),
-                )
+                factor = key.replace("_", " ").title()
+                table.add_row(factor, Text(f"{value:.1f}", style=score_color))
+                csv_rows.append([factor, f"{value:.1f}"])
 
             self.console.print(table)
+            self._save_stage_csv("analyze.csv", ["Factor", "Score (0-10)"], csv_rows)
 
         if signal.top_headlines:
             self.console.print("\n[bold]Recent Headlines:[/]")
@@ -414,6 +527,7 @@ class ReportFormatter:
 
         total_invested = 0.0
         total_pnl = 0.0
+        csv_rows = []
 
         for t in trades:
             pnl = t.pnl or 0
@@ -434,10 +548,20 @@ class ReportFormatter:
                 Text(f"{pnl:+.2f}", style=color),
                 Text(f"{pnl_pct:+.1f}%", style=color),
             )
+            csv_rows.append([
+                t.trade_id, t.symbol, t.trade_type, t.entry_date[:10],
+                f"{t.entry_price:.2f}", f"{t.quantity:.4f}", f"{t.amount:.2f}",
+                f"{current:.2f}", f"{pnl:+.2f}", f"{pnl_pct:+.1f}%",
+            ])
             total_invested += t.amount
             total_pnl += pnl
 
         self.console.print(table)
+        self._save_stage_csv(
+            "portfolio.csv",
+            ["ID", "Symbol", "Type", "Entry Date", "Entry Price", "Qty", "Amount", "Current", "PnL", "PnL %"],
+            csv_rows,
+        )
 
         pnl_color = "green" if total_pnl >= 0 else "red"
         self.console.print(f"Total Invested: INR {total_invested:,.2f}")
@@ -459,6 +583,17 @@ class ReportFormatter:
         table.add_column("Metric", width=25)
         table.add_column("Value", justify="right", width=20)
 
+        ur_color = "green" if report.unrealized_pnl >= 0 else "red"
+        summary_rows = [
+            ["Total Closed Trades", str(report.total_trades)],
+            ["Winning Trades", str(report.winning_trades)],
+            ["Losing Trades", str(report.losing_trades)],
+            ["Win Rate", f"{win_rate:.1f}%"],
+            ["Total PnL", f"INR {report.total_pnl:+,.2f}"],
+            ["Total PnL %", f"{report.total_pnl_pct:+.2f}%"],
+            ["Open Positions", str(report.open_positions)],
+            ["Unrealized PnL", f"INR {report.unrealized_pnl:+,.2f}"],
+        ]
         table.add_row("Total Closed Trades", str(report.total_trades))
         table.add_row("Winning Trades", f"[green]{report.winning_trades}[/]")
         table.add_row("Losing Trades", f"[red]{report.losing_trades}[/]")
@@ -466,11 +601,10 @@ class ReportFormatter:
         table.add_row("Total PnL", Text(f"INR {report.total_pnl:+,.2f}", style=pnl_color))
         table.add_row("Total PnL %", Text(f"{report.total_pnl_pct:+.2f}%", style=pnl_color))
         table.add_row("Open Positions", str(report.open_positions))
-
-        ur_color = "green" if report.unrealized_pnl >= 0 else "red"
         table.add_row("Unrealized PnL", Text(f"INR {report.unrealized_pnl:+,.2f}", style=ur_color))
 
         self.console.print(table)
+        self._save_stage_csv("gain_summary.csv", ["Metric", "Value"], summary_rows)
 
         # Best/Worst trades
         if report.best_trade:
@@ -494,6 +628,7 @@ class ReportFormatter:
             stock_table.add_column("PnL", justify="right", width=14)
             stock_table.add_column("PnL %", justify="right", width=10)
 
+            per_stock_csv_rows = []
             for sym, data in report.per_stock.items():
                 color = "green" if data["pnl"] >= 0 else "red"
                 stock_table.add_row(
@@ -502,8 +637,13 @@ class ReportFormatter:
                     Text(f"INR {data['pnl']:+,.2f}", style=color),
                     Text(f"{data['pnl_pct']:+.2f}%", style=color),
                 )
+                per_stock_csv_rows.append([
+                    sym, str(data["trades"]),
+                    f"INR {data['pnl']:+,.2f}", f"{data['pnl_pct']:+.2f}%",
+                ])
 
             self.console.print(stock_table)
+            self._save_stage_csv("gain_per_stock.csv", ["Symbol", "Trades", "PnL", "PnL %"], per_stock_csv_rows)
 
     def export_gain_report(self, report: GainReport) -> Path:
         """Write gain report to a dated JSON file."""
