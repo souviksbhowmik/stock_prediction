@@ -24,7 +24,7 @@ ner:
 llm:
   provider: ollama
   ollama:
-    model: "llama3.1:8b"
+    model: "qwen2.5:7b"
     base_url: "http://localhost:11434"
     timeout: 120
   cache_dir: data/news_cache
@@ -43,7 +43,7 @@ features:
     atr_period: 14
     stoch_period: 14
   sequence_length: 60
-  prediction_horizon: 1  # trading days ahead to predict (e.g. 1, 5, 10)
+  prediction_horizon: 7  # trading days ahead to predict (e.g. 1, 5, 7, 10)
 
 models:
   lstm:

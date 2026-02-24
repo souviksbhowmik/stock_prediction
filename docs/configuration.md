@@ -116,11 +116,22 @@ llm:
 | Key | Default | Description |
 |---|---|---|
 | `provider` | `ollama` | LLM backend. Currently only `ollama` is supported. |
-| `ollama.model` | `llama3.1:8b` | Ollama model tag. Must be pulled first (`ollama pull <model>`). `qwen2.5:7b` is recommended for better JSON output. |
+| `ollama.model` | `qwen2.5:7b` | Ollama model tag. Must be pulled first (`ollama pull <model>`). See model options below. |
 | `ollama.base_url` | `http://localhost:11434` | Ollama server address. Change if running Ollama on a remote machine. |
 | `ollama.timeout` | `120` | Seconds to wait for a single LLM response before timing out. Increase for slower hardware or larger models. |
 | `cache_dir` | `data/news_cache` | Directory for cached LLM responses (shared with news cache). |
 | `cache_expiry_hours` | `24` | How long cached LLM analysis is reused. LLM calls are slow, so 24 hours is a sensible default. |
+
+**Model options for `ollama.model`:**
+
+| Model | RAM needed | JSON reliability | Recommended for |
+|---|---|---|---|
+| `qwen2.5:7b` ← default | ~8 GB | Excellent | Best structured JSON output for broker scores |
+| `llama3.1:8b` | ~8 GB | Good | Strong general model, slightly more natural prose |
+| `llama3.2:3b` | ~4 GB | Fair | Low-RAM machines; lower quality broker scores |
+| `llama3.1:70b` | ~48 GB | Best | High-end GPU setups only |
+
+Pull a model before use: `ollama pull qwen2.5:7b`
 
 **Note:** LLM features are optional. Pass `--no-llm` on the CLI to skip all LLM calls.
 
@@ -174,7 +185,17 @@ Standard technical indicator parameters. These follow widely-used defaults; chan
 
 | Key | Default | Description |
 |---|---|---|
-| `prediction_horizon` | `1` | How many trading days ahead the signal label is based on. `1` = next day, `5` = next week, `10` = next two weeks. The label is a **point-to-point return** (day `t` close vs day `t+horizon` close), not an average over the period. Changing this requires retraining all models. |
+| `prediction_horizon` | `7` | How many trading days ahead the signal label is based on. The label is a **point-to-point return** (day `t` close vs day `t+horizon` close), not an average over the period. Changing this requires retraining all models. |
+
+**Horizon options:**
+
+| Value | Meaning | Suitable for |
+|---|---|---|
+| `1` | Next trading day | Short-term / intraday-style signals |
+| `5` | ~1 calendar week | Weekly swing trading |
+| `7` | ~1.5 calendar weeks ← default | Medium-term swing trading |
+| `10` | ~2 calendar weeks | Positional trades |
+| `21` | ~1 calendar month | Long-term position building |
 
 ---
 
@@ -333,8 +354,9 @@ paper_trading:
 
 | Goal | Setting | Suggested value |
 |---|---|---|
-| Predict next week instead of next day | `features.prediction_horizon` | `5` |
-| Use a better LLM for broker analysis | `llm.ollama.model` | `qwen2.5:7b` |
+| Predict next day instead of 1.5 weeks | `features.prediction_horizon` | `1` |
+| Predict next week | `features.prediction_horizon` | `5` |
+| Switch LLM to Llama 3.1 | `llm.ollama.model` | `llama3.1:8b` |
 | Reduce HOLD class bias (tighter band) | `signals.buy_return_threshold` / `sell_return_threshold` | `0.005` / `-0.005` |
 | Speed up training (fewer trees) | `models.xgboost.n_estimators` | `200` |
 | Reduce LSTM overfitting | `models.lstm.dropout` | `0.4` or `0.5` |
