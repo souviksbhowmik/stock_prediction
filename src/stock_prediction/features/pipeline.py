@@ -98,7 +98,9 @@ class FeaturePipeline:
         # Step 6: Create labels
         df = self._add_labels(df)
 
-        # Drop rows with NaN (from indicator warmup)
+        # Replace inf values (e.g. from pct_change on zero volume) with NaN,
+        # then drop all rows that still contain NaN or inf.
+        df = df.replace([float("inf"), float("-inf")], float("nan"))
         df = df.dropna()
 
         logger.info(f"Built features for {symbol}: {df.shape}")
