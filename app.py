@@ -54,6 +54,32 @@ st.markdown(
 
 /* Larger metric values */
 [data-testid="stMetricValue"] { font-size: 1.5rem !important; }
+
+/* Copyable HTML tables */
+.copy-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    margin-bottom: 1rem;
+}
+.copy-table th {
+    background: #1e3a5f;
+    color: white;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+}
+.copy-table td {
+    padding: 7px 12px;
+    border-bottom: 1px solid #e5e7eb;
+    white-space: nowrap;
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+}
+.copy-table tr:nth-child(even) td { background: #f8fafc; }
+.copy-table tr:hover td { background: #eff6ff !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -146,6 +172,41 @@ def _color_status(val: str) -> str:
         "no_data": "color:#d97706; font-weight:600",
         "failed":  "color:#dc2626; font-weight:600",
     }.get(val, "")
+
+
+def _color_short(val: str) -> str:
+    return "color:#dc2626; font-weight:600" if val == "Yes" else ""
+
+
+def _show_table(
+    df: pd.DataFrame,
+    style_map: dict | None = None,
+) -> None:
+    """Render a DataFrame as a copyable HTML table with optional per-column cell styling.
+
+    style_map: {column_name: callable(value) -> css_string}
+    """
+    cols = list(df.columns)
+    headers = "".join(f"<th>{c}</th>" for c in cols)
+
+    body_rows: list[str] = []
+    for _, row in df.iterrows():
+        cells: list[str] = []
+        for col in cols:
+            val = "" if row[col] is None else str(row[col])
+            css = style_map[col](val) if (style_map and col in style_map) else ""
+            style_attr = f' style="{css}"' if css else ""
+            cells.append(f"<td{style_attr}>{val}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    html = (
+        f'<div style="overflow-x:auto">'
+        f'<table class="copy-table">'
+        f"<thead><tr>{headers}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        f"</table></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def _suggestion_df(suggestions) -> pd.DataFrame:
@@ -558,8 +619,7 @@ def page_lookup() -> None:
             return
 
     st.success(f"Found **{len(rows)}** result(s) for '{query}'")
-    styled = pd.DataFrame(rows).style.map(_color_signal, subset=["Signal"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    _show_table(pd.DataFrame(rows), style_map={"Signal": _color_signal})
 
 
 # ─── Fetch Data ───────────────────────────────────────────────────────────────
@@ -609,11 +669,11 @@ def page_fetch_data() -> None:
                         if preview_sym is None:
                             preview_sym, preview_data = sym, data
 
-                st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+                _show_table(pd.DataFrame(summary))
 
                 if preview_data is not None:
                     _section(f"Preview: {preview_sym} — last 10 rows")
-                    st.dataframe(preview_data.df.tail(10).round(2), use_container_width=True)
+                    _show_table(preview_data.df.tail(10).round(2).reset_index())
 
             except Exception as e:
                 st.error(f"Fetch error: {e}")
@@ -632,8 +692,7 @@ def _render_train_results(results: dict) -> None:
         }
         for sym, r in results.items()
     ]
-    styled = pd.DataFrame(rows).style.map(_color_status, subset=["Status"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    _show_table(pd.DataFrame(rows), style_map={"Status": _color_status})
 
 
 def page_train() -> None:
@@ -841,10 +900,6 @@ def page_predict() -> None:
             )
 
     _section("Signal Table")
-
-    def _short_color(val: str) -> str:
-        return "color:#dc2626; font-weight:600" if val == "Yes" else ""
-
     rows = [
         {
             "Symbol":          sig.symbol,
@@ -859,13 +914,10 @@ def page_predict() -> None:
         }
         for sig in signals
     ]
-    styled = (
-        pd.DataFrame(rows)
-        .style
-        .map(_color_signal, subset=["Signal"])
-        .map(_short_color, subset=["Short?"])
+    _show_table(
+        pd.DataFrame(rows),
+        style_map={"Signal": _color_signal, "Short?": _color_short},
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ─── Analyze ──────────────────────────────────────────────────────────────────
@@ -988,7 +1040,7 @@ def page_analyze() -> None:
         ]
         if broker_rows:
             _section("Broker Analysis Scores")
-            st.dataframe(pd.DataFrame(broker_rows), use_container_width=True, hide_index=True)
+            _show_table(pd.DataFrame(broker_rows))
 
     if llm_summary:
         _section("LLM Summary")
@@ -1040,7 +1092,7 @@ def page_screen() -> None:
     # Top Picks
     _section("🏆 Top Picks")
     if result.top_picks:
-        st.dataframe(pd.DataFrame(result.top_picks), use_container_width=True, hide_index=True)
+        _show_table(pd.DataFrame(result.top_picks))
     else:
         st.caption("No top picks found.")
 
@@ -1049,19 +1101,19 @@ def page_screen() -> None:
     if result.sector_leaders:
         for sector, stocks in result.sector_leaders.items():
             with st.expander(f"{sector}  ({len(stocks)} stocks)"):
-                st.dataframe(pd.DataFrame(stocks), use_container_width=True, hide_index=True)
+                _show_table(pd.DataFrame(stocks))
     else:
         st.caption("No sector data.")
 
     # News Alerts
     if result.news_alerts:
         _section("📰 News Alerts (LLM Discovery)")
-        st.dataframe(pd.DataFrame(result.news_alerts), use_container_width=True, hide_index=True)
+        _show_table(pd.DataFrame(result.news_alerts))
 
     # Full Rankings
     _section("📊 Full Rankings")
     if result.full_rankings:
-        st.dataframe(pd.DataFrame(result.full_rankings), use_container_width=True, hide_index=True)
+        _show_table(pd.DataFrame(result.full_rankings))
 
 
 # ─── Trade ────────────────────────────────────────────────────────────────────
@@ -1171,8 +1223,10 @@ def page_portfolio() -> None:
         }
         for t in trades
     ]
-    styled = pd.DataFrame(rows).style.map(_color_pnl, subset=["Unrealized PnL ₹", "PnL %"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    _show_table(
+        pd.DataFrame(rows),
+        style_map={"Unrealized PnL ₹": _color_pnl, "PnL %": _color_pnl},
+    )
 
     total_pnl = sum(t.pnl or 0 for t in trades)
     total_inv = sum(t.amount for t in trades)
@@ -1248,8 +1302,10 @@ def page_gain_report() -> None:
             }
             for sym, d in report.per_stock.items()
         ]
-        styled = pd.DataFrame(rows).style.map(_color_pnl, subset=["Total PnL ₹", "PnL %"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        _show_table(
+            pd.DataFrame(rows),
+            style_map={"Total PnL ₹": _color_pnl, "PnL %": _color_pnl},
+        )
 
 
 # ─── Router ───────────────────────────────────────────────────────────────────
