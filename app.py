@@ -687,7 +687,7 @@ def _render_train_results(results: dict) -> None:
         {
             "Symbol":       sym,
             "Status":       r["status"],
-            "Val Accuracy": f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "—",
+            "Balanced Acc": f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "—",
             "Reason":       r["reason"],
         }
         for sym, r in results.items()

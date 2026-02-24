@@ -5,6 +5,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+from sklearn.metrics import balanced_accuracy_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
 
@@ -133,8 +134,8 @@ class ModelTrainer:
             xgb_weight = get_setting("models", "ensemble", "xgboost_weight", default=0.6)
         logger.info(
             f"Dynamic ensemble weights for {symbol}: "
-            f"LSTM={lstm_weight:.3f} (acc={lstm_val_acc:.4f}), "
-            f"XGB={xgb_weight:.3f} (acc={xgb_val_acc:.4f})"
+            f"LSTM={lstm_weight:.3f} (balanced_acc={lstm_val_acc:.4f}), "
+            f"XGB={xgb_weight:.3f} (balanced_acc={xgb_val_acc:.4f})"
         )
 
         # ── 5. Compute ensemble val accuracy with the best individual models
@@ -147,8 +148,9 @@ class ModelTrainer:
 
         ensemble_val = EnsembleModel(lstm_val, xgb_val, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
         val_preds = ensemble_val.predict(X_seq_val_s, X_tab_val_s)
-        val_accuracy = float(np.mean([p.signal_idx for p in val_preds] == y_val))
-        logger.info(f"Best ensemble val accuracy for {symbol}: {val_accuracy:.4f}")
+        val_pred_labels = np.array([p.signal_idx for p in val_preds])
+        val_accuracy = balanced_accuracy_score(y_val, val_pred_labels)
+        logger.info(f"Best ensemble balanced val accuracy for {symbol}: {val_accuracy:.4f}")
 
         # ── 5. Retrain on the full dataset with best hyperparameters ──────
         logger.info(f"Retraining on full dataset for {symbol}...")
@@ -212,16 +214,16 @@ class ModelTrainer:
         for params in _XGB_PARAM_GRID:
             model = XGBoostPredictor(**params)
             model.train(X_train, y_train, X_val, y_val, sample_weight=sample_weight)
-            acc = float(np.mean(model.predict(X_val) == y_val))
+            acc = balanced_accuracy_score(y_val, model.predict(X_val))
             n_est = getattr(model.model, "best_iteration", self._cfg_xgb_n_estimators()) + 1
-            logger.info(f"  XGB {params} → val_acc={acc:.4f}, best_iter={n_est}")
+            logger.info(f"  XGB {params} → balanced_acc={acc:.4f}, best_iter={n_est}")
             if acc > best_acc:
                 best_acc = acc
                 best_params = dict(params)
                 best_n_est = n_est
 
         logger.info(
-            f"Best XGB: {best_params}, n_estimators={best_n_est}, val_acc={best_acc:.4f}"
+            f"Best XGB: {best_params}, n_estimators={best_n_est}, balanced_acc={best_acc:.4f}"
         )
         return best_params, best_n_est, best_acc
 
@@ -243,16 +245,16 @@ class ModelTrainer:
             model = LSTMPredictor(input_size=n_features, **params)
             history = model.train(X_seq_train, y_train, X_seq_val, y_val,
                                   class_weights=class_weights)
-            acc = float(np.mean(model.predict(X_seq_val) == y_val))
+            acc = balanced_accuracy_score(y_val, model.predict(X_seq_val))
             epoch = int(history.get("best_epoch", model.epochs))  # type: ignore[arg-type]
-            logger.info(f"  LSTM {params} → val_acc={acc:.4f}, best_epoch={epoch}")
+            logger.info(f"  LSTM {params} → balanced_acc={acc:.4f}, best_epoch={epoch}")
             if acc > best_acc:
                 best_acc = acc
                 best_params = dict(params)
                 best_epochs = epoch
 
         logger.info(
-            f"Best LSTM: {best_params}, epochs={best_epochs}, val_acc={best_acc:.4f}"
+            f"Best LSTM: {best_params}, epochs={best_epochs}, balanced_acc={best_acc:.4f}"
         )
         return best_params, best_epochs, best_acc
 
