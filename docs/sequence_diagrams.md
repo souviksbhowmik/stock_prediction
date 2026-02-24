@@ -184,27 +184,39 @@ sequenceDiagram
     end
 
     FeaturePipeline->>FeaturePipeline: create labels (return_1d → BUY/HOLD/SELL)
+    FeaturePipeline->>FeaturePipeline: dropna (removes indicator warmup rows)
     FeaturePipeline->>FeaturePipeline: build 60-day rolling windows (LSTM sequences)
     FeaturePipeline->>FeaturePipeline: extract tabular snapshots (XGBoost input)
-    FeaturePipeline-->>ModelTrainer: sequences(N,60,F), tabular(N,F), labels(N,)
 
-    ModelTrainer->>ModelTrainer: chronological split (80% train / 20% val)
-    ModelTrainer->>ModelTrainer: StandardScaler.fit_transform(train), transform(val)
+    alt yfinance returned no data OR fewer than 70 rows after dropna
+        FeaturePipeline-->>ModelTrainer: raises ValueError(reason)
+        ModelTrainer-->>CLI: status=no_data, reason=<specific message>
+    else feature build succeeded
+        FeaturePipeline-->>ModelTrainer: sequences(N,60,F), tabular(N,F), labels(N,)
 
-    ModelTrainer->>LSTMPredictor: train(X_seq_train, y_train, X_seq_val, y_val)
-    Note over LSTMPredictor: Adam + CrossEntropyLoss<br/>up to 50 epochs<br/>early stop patience=10
-    LSTMPredictor-->>ModelTrainer: trained LSTM
+        ModelTrainer->>ModelTrainer: chronological split (80% train / 20% val)
+        ModelTrainer->>ModelTrainer: StandardScaler.fit_transform(train), transform(val)
 
-    ModelTrainer->>XGBoostPredictor: train(X_tab_train, y_train, X_tab_val, y_val)
-    Note over XGBoostPredictor: multi:softprob<br/>up to 500 trees<br/>early stop 20 rounds
-    XGBoostPredictor-->>ModelTrainer: trained XGBoost
+        ModelTrainer->>LSTMPredictor: train(X_seq_train, y_train, X_seq_val, y_val)
+        Note over LSTMPredictor: Adam + CrossEntropyLoss<br/>up to 50 epochs<br/>early stop patience=10
+        LSTMPredictor-->>ModelTrainer: trained LSTM
 
-    ModelTrainer->>FileSystem: save lstm.pt
-    ModelTrainer->>FileSystem: save xgboost.joblib
-    ModelTrainer->>FileSystem: save meta.joblib (scalers + feature_names + trained_at)
+        ModelTrainer->>XGBoostPredictor: train(X_tab_train, y_train, X_tab_val, y_val)
+        Note over XGBoostPredictor: multi:softprob<br/>up to 500 trees<br/>early stop 20 rounds
+        XGBoostPredictor-->>ModelTrainer: trained XGBoost
 
-    ModelTrainer-->>CLI: training results summary
-    CLI->>User: Console — "Training complete: 1/1 stocks trained successfully"
+        ModelTrainer->>ModelTrainer: compute validation accuracy
+        ModelTrainer->>FileSystem: save lstm.pt
+        ModelTrainer->>FileSystem: save xgboost.joblib
+        ModelTrainer->>FileSystem: save meta.joblib (scalers + feature_names + trained_at)
+        ModelTrainer-->>CLI: status=success, accuracy=0.XXXX
+    end
+
+    ModelTrainer-->>CLI: dict[symbol → {status, reason, accuracy, model}]
+    CLI->>User: Console — "Training complete: N/M stocks trained successfully"
+    CLI->>User: Console — failed symbols with reasons (if any)
+    CLI->>FileSystem: train_summary.csv (Symbol, Status, Val Accuracy, Reason)
+    CLI->>User: Console — "Saved: data/reports/train_summary.csv"
 ```
 
 ---

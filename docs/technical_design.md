@@ -114,6 +114,10 @@ Returns `(sequences, tabular, labels, feature_names)`:
 - **Tabular:** Shape `(N, n_features)` — last row of each window for XGBoost
 - **Labels:** `signal` column mapped from 1-day returns
 
+Raises `ValueError` (instead of returning empty arrays) in two cases:
+- **No price data** — yfinance returned nothing for the symbol (wrong ticker, delisted, network issue)
+- **Insufficient rows** — fewer than `sequence_length + 10` (70) rows remain after `dropna()`; requires ~130+ raw trading days. Error message includes the actual row count and a hint to use an earlier `--start-date`.
+
 ### Label Creation
 
 | Condition | Signal | Value |
@@ -359,14 +363,28 @@ confidence = max(ensemble_probs)
 
 **Class: ModelTrainer**
 
+**`train_batch` return value:** `dict[str, dict]` — one entry per symbol with keys:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `status` | str | `'success'`, `'no_data'`, or `'failed'` |
+| `reason` | str | Specific failure message; empty string on success |
+| `accuracy` | float\|None | Validation accuracy; `None` on failure |
+| `model` | EnsembleModel\|None | Trained model; `None` on failure |
+
+`ValueError` from the feature pipeline is caught as `no_data`; all other exceptions are caught as `failed`. After every run, results are written to `data/reports/train_summary.csv`.
+
+**`train_stock` return value:** `(EnsembleModel | None, float | None)` — model and validation accuracy.
+
 Training workflow:
-1. Feature pipeline builds features with labels
+1. Feature pipeline builds features with labels — raises `ValueError` if data is missing or insufficient
 2. Chronological train/val split (80/20, no shuffling)
 3. `StandardScaler` fitted on training data for both sequences and tabular
 4. LSTM training with early stopping on validation loss
 5. XGBoost training with early stopping on validation mlogloss
-6. Ensemble validation accuracy
+6. Ensemble validation accuracy computed on held-out val set
 7. Save all artifacts
+8. Write `data/reports/train_summary.csv` with per-symbol status, accuracy, and failure reason
 
 **Model loading:**
 - `load_models(symbol)` returns `(ensemble, scaler, seq_scaler, model_age_days)`
@@ -657,7 +675,13 @@ stockpredict train --symbols RELIANCE.NS
   │
   ├─ prepare_training_data()
   │    ├─ Rolling 60-day windows → LSTM sequences (N, 60, F)
-  │    └─ Last row of windows → XGBoost tabular (N, F)
+  │    ├─ Last row of windows → XGBoost tabular (N, F)
+  │    └─ raises ValueError if:
+  │         ├─ yfinance returned no price data (wrong ticker / network)
+  │         └─ < 70 rows after dropna (need ~130+ raw trading days)
+  │
+  ├─ [on ValueError]  → status=no_data, reason=<specific message>
+  ├─ [on Exception]   → status=failed,  reason=<exception message>
   │
   ├─ Chronological split (80% train / 20% val)
   │
@@ -669,10 +693,13 @@ stockpredict train --symbols RELIANCE.NS
   ├─ XGBoostPredictor.train(X_tab_train, y_train, X_tab_val, y_val)
   │    └─ multi:softprob + early stopping (20 rounds)
   │
-  └─ Save to data/models/RELIANCE_NS/
-       ├─ lstm.pt
-       ├─ xgboost.joblib
-       └─ meta.joblib (scalers, feature_names, trained_at)
+  ├─ Save to data/models/RELIANCE_NS/
+  │    ├─ lstm.pt
+  │    ├─ xgboost.joblib
+  │    └─ meta.joblib (scalers, feature_names, trained_at)
+  │
+  └─ Write data/reports/train_summary.csv
+       └─ Symbol | Status | Val Accuracy | Reason  (one row per symbol)
 ```
 
 ### Prediction Pipeline
@@ -740,6 +767,19 @@ stock_prediction/
 │   ├── news_cache/                # RSS + LLM response cache
 │   │   ├── {md5_query}.json       # RSS articles (6-hour expiry)
 │   │   └── {md5_symbol_date}.json # LLM scores (24-hour expiry)
+│   ├── reports/                   # Per-run stage CSV outputs (gitignored, overwritten each run)
+│   │   ├── train_summary.csv      # Per-symbol training status, accuracy, failure reason
+│   │   ├── signals.csv            # Trading signals (predict/screen)
+│   │   ├── short_candidates.csv   # Short selling candidates
+│   │   ├── top_picks.csv          # Pre-screened top picks
+│   │   ├── sector_momentum.csv    # Sector leaders
+│   │   ├── news_alerts.csv        # News-discovered stocks
+│   │   ├── shortlist.csv          # Buy / Short / Trending candidates
+│   │   ├── suggestions.csv        # Ranked momentum watchlist
+│   │   ├── analyze.csv            # Broker analysis scores (single stock)
+│   │   ├── portfolio.csv          # Open paper trading positions
+│   │   ├── gain_summary.csv       # Paper trading gain/loss summary
+│   │   └── gain_per_stock.csv     # Per-symbol gain/loss breakdown
 │   ├── processed/                 # Export outputs
 │   │   ├── predictions_YYYY-MM-DD.csv
 │   │   └── predictions_YYYY-MM-DD.json
