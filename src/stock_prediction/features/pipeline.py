@@ -49,7 +49,7 @@ class FeaturePipeline:
         # Step 1: Fetch OHLCV
         stock_data = self.data_provider.fetch_historical(symbol, start_date, end_date)
         if stock_data.is_empty:
-            logger.error(f"No data for {symbol}")
+            logger.error(f"No price data returned by yfinance for {symbol} — check ticker format or network")
             return pd.DataFrame()
 
         df = stock_data.df
@@ -120,9 +120,16 @@ class FeaturePipeline:
             - feature_names: list of feature column names
         """
         df = self.build_features(symbol, start_date, end_date)
-        if df.empty or len(df) < self.sequence_length + 10:
-            logger.error(f"Insufficient data for {symbol}")
-            return np.array([]), np.array([]), np.array([]), []
+        if df.empty:
+            raise ValueError(
+                "yfinance returned no price data — check ticker format or network"
+            )
+        if len(df) < self.sequence_length + 10:
+            raise ValueError(
+                f"Only {len(df)} rows after feature build "
+                f"(need {self.sequence_length + 10}); "
+                f"use an earlier --start-date (default 2020-01-01 gives ~1200 rows)"
+            )
 
         # Separate features and labels
         label_cols = ["return_1d", "return_5d", "signal"]

@@ -44,7 +44,6 @@ class ModelTrainer:
         )
 
         if len(sequences) == 0:
-            logger.error(f"No training data for {symbol}")
             return None, None
 
         # Chronological train/val split
@@ -112,20 +111,21 @@ class ModelTrainer:
             logger.info(f"Training {i + 1}/{len(symbols)}: {symbol}")
             try:
                 model, accuracy = self.train_stock(symbol, start_date, end_date)
-                if model is None:
-                    results[symbol] = {
-                        "status": "no_data",
-                        "reason": "No training data returned by feature pipeline",
-                        "accuracy": None,
-                        "model": None,
-                    }
-                else:
-                    results[symbol] = {
-                        "status": "success",
-                        "reason": "",
-                        "accuracy": accuracy,
-                        "model": model,
-                    }
+                results[symbol] = {
+                    "status": "success",
+                    "reason": "",
+                    "accuracy": accuracy,
+                    "model": model,
+                }
+            except ValueError as e:
+                # Data availability / insufficiency problems
+                logger.error(f"No usable data for {symbol}: {e}")
+                results[symbol] = {
+                    "status": "no_data",
+                    "reason": str(e),
+                    "accuracy": None,
+                    "model": None,
+                }
             except Exception as e:
                 logger.error(f"Training failed for {symbol}: {e}")
                 results[symbol] = {
