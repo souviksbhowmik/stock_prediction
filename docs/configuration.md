@@ -185,15 +185,15 @@ Standard technical indicator parameters. These follow widely-used defaults; chan
 
 | Key | Default | Description |
 |---|---|---|
-| `prediction_horizon` | `7` | How many trading days ahead the signal label is based on. The label is a **point-to-point return** (day `t` close vs day `t+horizon` close), not an average over the period. Changing this requires retraining all models. |
+| `prediction_horizon` | `5` | How many trading days ahead the signal label is based on. The label is a **point-to-point return** (day `t` close vs day `t+horizon` close), not an average over the period. Changing this requires retraining all models. |
 
 **Horizon options:**
 
 | Value | Meaning | Suitable for |
 |---|---|---|
 | `1` | Next trading day | Short-term / intraday-style signals |
-| `5` | ~1 calendar week | Weekly swing trading |
-| `7` | ~1.5 calendar weeks ← default | Medium-term swing trading |
+| `5` | Same day next week ← default | Weekly swing trading (lands on same weekday) |
+| `7` | ~2 calendar weeks | Medium-term swing trading |
 | `10` | ~2 calendar weeks | Positional trades |
 | `21` | ~1 calendar month | Long-term position building |
 
@@ -354,8 +354,8 @@ paper_trading:
 
 | Goal | Setting | Suggested value |
 |---|---|---|
-| Predict next day instead of 1.5 weeks | `features.prediction_horizon` | `1` |
-| Predict next week | `features.prediction_horizon` | `5` |
+| Predict next day instead of next week | `features.prediction_horizon` | `1` |
+| Predict 2 weeks out | `features.prediction_horizon` | `10` |
 | Switch LLM to Llama 3.1 | `llm.ollama.model` | `llama3.1:8b` |
 | Reduce HOLD class bias (tighter band) | `signals.buy_return_threshold` / `sell_return_threshold` | `0.005` / `-0.005` |
 | Speed up training (fewer trees) | `models.xgboost.n_estimators` | `200` |

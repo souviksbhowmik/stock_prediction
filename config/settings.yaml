@@ -43,7 +43,7 @@ features:
     atr_period: 14
     stoch_period: 14
   sequence_length: 60
-  prediction_horizon: 7  # trading days ahead to predict (e.g. 1, 5, 7, 10)
+  prediction_horizon: 5  # trading days ahead to predict (e.g. 1, 5, 7, 10)
 
 models:
   lstm:
