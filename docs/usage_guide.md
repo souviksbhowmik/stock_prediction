@@ -211,6 +211,35 @@ stockpredict screen --no-llm                             # Disable LLM discovery
 
 ---
 
+## Step 6b: Look Up a Signal by Company Name
+
+### `lookup` — Find Signals by Name or Partial Name
+
+**What it does:**
+Searches for stocks matching any part of a company name, alias, or ticker symbol (case-insensitive substring) and returns signals for all matches. Useful when you know a company name but not its exact ticker. Three matching layers are applied:
+
+1. Substring match in company aliases (e.g. `"sbi"` matches `"state bank of india"`)
+2. Substring match in canonical company names (e.g. `"tata"` matches Tata Motors, Tata Steel, TCS, Tata Consumer)
+3. Substring match in the ticker symbol itself (e.g. `"hdfc"` matches `HDFCBANK.NS`, `HDFCLIFE.NS`)
+
+For each matched ticker it loads the trained model and generates a signal. If no model has been trained for a symbol, that row shows `N/A — No trained model` so you know which ones still need training.
+
+**Dependencies:** Trained models in `data/models/` for signal generation. Matching itself works without any models.
+
+**Output:**
+- Console: Rich table with all matches — Symbol, Company, Signal, Confidence, BUY%, HOLD%, SELL%, Note
+- File: `data/reports/lookup.csv` — same data. Overwritten on each run.
+
+```bash
+stockpredict lookup tata          # matches TCS, Tata Motors, Tata Steel, Tata Consumer
+stockpredict lookup bank          # matches HDFC Bank, ICICI Bank, SBI, Axis, Kotak, IndusInd
+stockpredict lookup infosys       # exact name match
+stockpredict lookup "sun phar"    # partial name with space (use quotes)
+stockpredict lookup hdfc          # matches by ticker prefix
+```
+
+---
+
 ## Step 7: Paper Trading
 
 Simulate trades without real money to test your strategy. All positions and trade history are persisted in `data/trades/ledger.json` and updated on every operation.
@@ -317,6 +346,7 @@ stockpredict test-calculate-gain --export                # Export to JSON
 | 4 | `predict` | `train` — model files must exist in `data/models/` |
 | 5 | `analyze` | `train` — model file must exist for the specific symbol |
 | 6 | `screen` | Nothing |
+| 6b | `lookup` | Nothing for matching; trained models in `data/models/` for signal generation |
 | 7a | `test-buy` | Nothing (uses live price from yfinance) |
 | 7a | `test-short` | Nothing (uses live price from yfinance) |
 | 7b | `test-sell` | `test-buy` or `test-short` — open position must exist |
@@ -335,6 +365,7 @@ stockpredict test-calculate-gain --export                # Export to JSON
 | `train` | Training progress | — | `data/models/{SYMBOL}/lstm.pt`, `xgboost.joblib`, `meta.joblib` |
 | `predict` | 5 signal tables | `signals.csv`, `short_candidates.csv`, `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv` | `data/processed/predictions_YYYY-MM-DD.csv/json` (with `--export`) |
 | `screen` | 4 screener tables | `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv`, `signals.csv`, `short_candidates.csv` | — |
+| `lookup` | Matched stocks with signals | `lookup.csv` | — |
 | `analyze` | Signal + LLM analysis | `analyze.csv` (broker scores) | — |
 | `test-buy` | Trade confirmation | — | `data/trades/ledger.json` |
 | `test-short` | Trade confirmation | — | `data/trades/ledger.json` |
