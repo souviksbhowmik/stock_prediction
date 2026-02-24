@@ -55,22 +55,22 @@ class XGBoostPredictor:
         if X_val is not None and y_val is not None:
             eval_set.append((X_val, y_val))
 
-        self.model.fit(
-            X_train,
-            y_train,
-            eval_set=eval_set,
-            verbose=False,
-        )
+        fit_kwargs = dict(eval_set=eval_set, verbose=False)
+        if X_val is not None and y_val is not None:
+            # Early stopping requires a validation set as the last eval_set entry
+            fit_kwargs["early_stopping_rounds"] = self.early_stopping_rounds
+
+        self.model.fit(X_train, y_train, **fit_kwargs)
 
         # Get best iteration info
         results = self.model.evals_result()
         train_loss = results["validation_0"]["mlogloss"]
         val_loss = results.get("validation_1", {}).get("mlogloss", [])
 
-        logger.info(
-            f"XGBoost trained: {self.model.best_iteration} iterations, "
-            f"best score: {self.model.best_score:.4f}"
-        )
+        best_iter = getattr(self.model, "best_iteration", self.n_estimators)
+        best_score = getattr(self.model, "best_score", None)
+        score_str = f", best score: {best_score:.4f}" if best_score is not None else ""
+        logger.info(f"XGBoost trained: {best_iter} iterations{score_str}")
         return {"train_loss": train_loss, "val_loss": val_loss}
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
