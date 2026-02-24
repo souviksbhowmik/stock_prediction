@@ -6,6 +6,8 @@ Run with:
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -167,6 +169,51 @@ def _suggestion_df(suggestions) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ─── Background training worker ──────────────────────────────────────────────
+
+def _run_training_bg(
+    symbol_list: list[str],
+    sd: str | None,
+    ed: str | None,
+    use_news: bool,
+    use_llm: bool,
+    progress: dict,
+) -> None:
+    """Runs in a daemon thread — keeps going even if the user navigates away."""
+    try:
+        from stock_prediction.models.trainer import ModelTrainer
+        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm)
+        for i, sym in enumerate(symbol_list):
+            if progress.get("cancelled"):
+                break
+            progress["current_sym"] = sym
+            progress["done"] = i
+            try:
+                model, accuracy = trainer.train_stock(sym, sd, ed)
+                if model is None:
+                    progress["results"][sym] = {
+                        "status": "no_data", "accuracy": None, "reason": "No training data",
+                    }
+                else:
+                    progress["results"][sym] = {
+                        "status": "success", "accuracy": accuracy, "reason": "",
+                    }
+            except ValueError as e:
+                progress["results"][sym] = {
+                    "status": "no_data", "accuracy": None, "reason": str(e),
+                }
+            except Exception as e:
+                progress["results"][sym] = {
+                    "status": "failed", "accuracy": None, "reason": str(e),
+                }
+            progress["done"] = i + 1
+    except Exception as e:
+        progress["error"] = str(e)
+    finally:
+        progress["complete"] = True
+        progress["current_sym"] = None
+
+
 def _section(title: str, color: str = "#2563eb") -> None:
     st.markdown(
         f'<div class="section-header" style="border-color:{color}">{title}</div>',
@@ -226,6 +273,18 @@ with st.sidebar:
     st.markdown("*Indian Market · NIFTY 50*")
     st.markdown("---")
     page = st.radio("Navigate", PAGES, label_visibility="collapsed")
+    # Training status badge — visible from every page
+    _tp = st.session_state.get("train_progress")
+    if _tp and not _tp.get("complete"):
+        _done  = _tp.get("done", 0)
+        _total = _tp.get("total", 1)
+        st.markdown("---")
+        st.markdown(
+            f'<div style="background:#1e40af;color:white;border-radius:8px;'
+            f'padding:8px 12px;font-size:0.8rem;font-weight:600">'
+            f'⏳ Training {_done}/{_total}</div>',
+            unsafe_allow_html=True,
+        )
     st.markdown("---")
     st.markdown("**Watchlist**")
     wl_sorted = sorted(st.session_state.watchlist)
@@ -496,14 +555,75 @@ def page_fetch_data() -> None:
 
 
 # ─── Train ────────────────────────────────────────────────────────────────────
+def _render_train_results(results: dict) -> None:
+    ok = sum(1 for v in results.values() if v["status"] == "success")
+    st.success(f"Training complete: **{ok} / {len(results)}** stocks trained successfully")
+    rows = [
+        {
+            "Symbol":       sym,
+            "Status":       r["status"],
+            "Val Accuracy": f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "—",
+            "Reason":       r["reason"],
+        }
+        for sym, r in results.items()
+    ]
+    styled = pd.DataFrame(rows).style.map(_color_status, subset=["Status"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
 def page_train() -> None:
     st.title("🧠 Train — Model Training")
     st.caption(
         "Trains an LSTM + XGBoost ensemble for each symbol. "
-        "Trained models are saved to `data/models/`. May take several minutes per stock."
+        "Trained models are saved to `data/models/`. "
+        "**Training runs in the background — you can freely navigate to other pages.**"
     )
 
-    # NIFTY 50 button must come BEFORE the text_input so session state is set first
+    tp = st.session_state.get("train_progress")
+    training_active = tp is not None and not tp.get("complete", False)
+
+    # ── In-progress view ──────────────────────────────────────────────────────
+    if training_active:
+        done  = tp.get("done", 0)
+        total = tp.get("total", 1)
+        current = tp.get("current_sym") or ""
+        frac  = done / total if total else 0
+
+        st.info("⏳ Training is running in the background — safe to navigate away and return.")
+        st.progress(frac)
+        st.markdown(
+            f"**{done} / {total}** complete"
+            + (f" — currently training **{current}**" if current else "")
+        )
+
+        if tp.get("error"):
+            st.error(f"Training error: {tp['error']}")
+
+        # Show partial results so far
+        if tp["results"]:
+            _section("Results so far")
+            _render_train_results(tp["results"])
+
+        col1, col2 = st.columns([1, 5])
+        with col1:
+            if st.button("⏹ Cancel", key="tr_cancel"):
+                tp["cancelled"] = True
+        # Auto-refresh every 2 s to show live progress
+        time.sleep(2)
+        st.rerun()
+        return
+
+    # ── Completed view ────────────────────────────────────────────────────────
+    if tp is not None and tp.get("complete"):
+        if tp.get("error"):
+            st.error(f"Training stopped with error: {tp['error']}")
+        _render_train_results(tp["results"])
+        if st.button("🔄 Train Again", key="tr_again"):
+            st.session_state["train_progress"] = None
+            st.rerun()
+        return
+
+    # ── Setup form (only shown when not training) ─────────────────────────────
     if st.button("Use All NIFTY 50 Stocks", key="tr_nifty"):
         from stock_prediction.utils.constants import NIFTY_50_TICKERS
         st.session_state["tr_syms"] = ",".join(NIFTY_50_TICKERS)
@@ -534,56 +654,32 @@ def page_train() -> None:
             st.warning("Please enter at least one symbol.")
             return
 
-        st.info(f"Training {len(symbol_list)} stock(s) — this may take a while …")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        try:
-            from stock_prediction.models.trainer import ModelTrainer
-            trainer = ModelTrainer(use_news=use_news, use_llm=use_llm)
-            sd = str(start_date) if start_date else None
-            ed = str(end_date) if end_date else None
-
-            results: dict[str, dict] = {}
-            for i, sym in enumerate(symbol_list):
-                status_text.markdown(f"Training **{sym}** ({i + 1} / {len(symbol_list)}) …")
-                try:
-                    model, accuracy = trainer.train_stock(sym, sd, ed)
-                    if model is None:
-                        results[sym] = {"status": "no_data", "accuracy": None, "reason": "No training data"}
-                    else:
-                        results[sym] = {"status": "success", "accuracy": accuracy, "reason": ""}
-                except ValueError as e:
-                    results[sym] = {"status": "no_data", "accuracy": None, "reason": str(e)}
-                except Exception as e:
-                    results[sym] = {"status": "failed", "accuracy": None, "reason": str(e)}
-                progress_bar.progress((i + 1) / len(symbol_list))
-
-            status_text.empty()
-            st.session_state.train_results = results
-
-        except Exception as e:
-            st.error(f"Training error: {e}")
-            return
-
-    results = st.session_state.train_results
-    if results is None:
-        return
-
-    ok = sum(1 for v in results.values() if v["status"] == "success")
-    st.success(f"Training complete: **{ok} / {len(results)}** stocks trained successfully")
-
-    rows = [
-        {
-            "Symbol":       sym,
-            "Status":       r["status"],
-            "Val Accuracy": f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "—",
-            "Reason":       r["reason"],
+        progress: dict = {
+            "symbols":     symbol_list,
+            "total":       len(symbol_list),
+            "done":        0,
+            "current_sym": None,
+            "results":     {},
+            "complete":    False,
+            "cancelled":   False,
+            "error":       None,
         }
-        for sym, r in results.items()
-    ]
-    styled = pd.DataFrame(rows).style.map(_color_status, subset=["Status"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.session_state["train_progress"] = progress
+
+        thread = threading.Thread(
+            target=_run_training_bg,
+            args=(
+                symbol_list,
+                str(start_date) if start_date else None,
+                str(end_date) if end_date else None,
+                use_news,
+                use_llm,
+                progress,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        st.rerun()
 
 
 # ─── Predict ──────────────────────────────────────────────────────────────────
