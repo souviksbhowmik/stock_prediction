@@ -42,16 +42,14 @@ st.markdown(
     margin: 1.2rem 0 0.4rem;
 }
 
-/* Watchlist chips in sidebar */
-.wl-chip {
-    display: inline-block;
-    background: #dbeafe;
-    color: #1e40af;
-    padding: 2px 9px;
-    border-radius: 12px;
-    font-size: 0.72rem;
-    font-weight: 600;
-    margin: 2px;
+/* Watchlist action panel */
+.wl-action-panel {
+    background: #f0f7ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-top: 4px;
+    font-size: 0.78rem;
 }
 
 /* Larger metric values */
@@ -232,6 +230,14 @@ def _signal_badge(signal: str) -> None:
     )
 
 
+def _add_sym_to_input(session_key: str, symbol: str) -> None:
+    """Append symbol to a comma-separated session state input field (no duplicates)."""
+    existing = _parse_symbols(st.session_state.get(session_key, ""))
+    if symbol not in existing:
+        existing.append(symbol)
+    st.session_state[session_key] = ",".join(existing)
+
+
 def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm):
     """Shared prediction logic — returns TradingSignal or raises."""
     from stock_prediction.features.pipeline import FeaturePipeline
@@ -286,15 +292,74 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
     st.markdown("---")
-    st.markdown("**Watchlist**")
+    st.markdown("**Watchlist** — click a symbol to act on it")
     wl_sorted = sorted(st.session_state.watchlist)
     if wl_sorted:
-        chips = " ".join(
-            f'<span class="wl-chip">{s.replace(".NS", "")}</span>' for s in wl_sorted
-        )
-        st.markdown(chips, unsafe_allow_html=True)
-        if st.button("🗑 Clear Watchlist", key="clear_wl"):
+        selected_sym = st.session_state.get("wl_selected")
+
+        # One button per symbol — highlighted when selected
+        for sym in wl_sorted:
+            label = sym.replace(".NS", "")
+            is_sel = sym == selected_sym
+            if st.button(
+                f"{'▶ ' if is_sel else ''}{label}",
+                key=f"wl_chip_{sym}",
+                use_container_width=True,
+                type="primary" if is_sel else "secondary",
+            ):
+                st.session_state["wl_selected"] = None if is_sel else sym
+                st.rerun()
+
+        # Action panel shown below when a symbol is selected
+        if selected_sym and selected_sym in st.session_state.watchlist:
+            sname = selected_sym.replace(".NS", "")
+            st.markdown(
+                f'<div class="wl-action-panel">Add <b>{sname}</b> to …</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Pages that accept multiple symbols (appended)
+            multi_actions = [
+                ("🧠 Train",      "tr_syms"),
+                ("🔮 Predict",    "pr_syms"),
+                ("📥 Fetch Data", "fd_syms"),
+                ("📡 Screen",     "sc_syms"),
+            ]
+            # Pages that accept a single symbol (set directly)
+            single_actions = [
+                ("🔬 Analyze", "an_sym"),
+                ("💰 Trade",   "td_sym"),
+            ]
+
+            col1, col2 = st.columns(2)
+            for i, (lbl, key) in enumerate(multi_actions):
+                with (col1 if i % 2 == 0 else col2):
+                    if st.button(lbl, key=f"wl_act_{key}", use_container_width=True):
+                        _add_sym_to_input(key, selected_sym)
+                        st.toast(f"{sname} → {lbl.split()[-1]}", icon="✅")
+
+            for i, (lbl, key) in enumerate(single_actions):
+                with (col1 if i % 2 == 0 else col2):
+                    if st.button(lbl, key=f"wl_act_{key}", use_container_width=True):
+                        st.session_state[key] = selected_sym
+                        st.toast(f"{sname} → {lbl.split()[-1]}", icon="✅")
+
+            if st.button("⭐ All Pages", key="wl_act_all", use_container_width=True):
+                for _, key in multi_actions:
+                    _add_sym_to_input(key, selected_sym)
+                for _, key in single_actions:
+                    st.session_state[key] = selected_sym
+                st.toast(f"{sname} added to all pages", icon="⭐")
+
+            if st.button("🗑 Remove", key="wl_remove", use_container_width=True):
+                st.session_state.watchlist.discard(selected_sym)
+                st.session_state["wl_selected"] = None
+                st.rerun()
+
+        st.markdown("")
+        if st.button("🗑 Clear All", key="clear_wl", use_container_width=True):
             st.session_state.watchlist.clear()
+            st.session_state["wl_selected"] = None
             st.rerun()
     else:
         st.caption("Empty — add symbols from Suggest / Shortlist")
