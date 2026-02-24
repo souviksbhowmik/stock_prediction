@@ -30,10 +30,11 @@ class ModelTrainer:
         symbol: str,
         start_date: str | None = None,
         end_date: str | None = None,
-    ) -> EnsembleModel | None:
+    ) -> tuple[EnsembleModel | None, float | None]:
         """Train models for a single stock.
 
-        Returns EnsembleModel or None if training fails.
+        Returns (EnsembleModel, validation_accuracy) on success,
+        or (None, None) if there is no training data.
         """
         logger.info(f"Training models for {symbol}")
 
@@ -44,7 +45,7 @@ class ModelTrainer:
 
         if len(sequences) == 0:
             logger.error(f"No training data for {symbol}")
-            return None
+            return None, None
 
         # Chronological train/val split
         split_idx = int(len(sequences) * self.train_split)
@@ -90,23 +91,49 @@ class ModelTrainer:
         # Save models
         self._save_models(symbol, lstm, xgb, scaler, seq_scaler, feature_names)
 
-        return ensemble
+        return ensemble, float(accuracy)
 
     def train_batch(
         self,
         symbols: list[str],
         start_date: str | None = None,
         end_date: str | None = None,
-    ) -> dict[str, EnsembleModel | None]:
-        """Train models for multiple stocks."""
-        results: dict[str, EnsembleModel | None] = {}
+    ) -> dict[str, dict]:
+        """Train models for multiple stocks.
+
+        Returns a dict mapping symbol to a result dict with keys:
+          status   : 'success' | 'no_data' | 'failed'
+          reason   : human-readable failure reason (empty string on success)
+          accuracy : validation accuracy float, or None on failure
+          model    : EnsembleModel or None
+        """
+        results: dict[str, dict] = {}
         for i, symbol in enumerate(symbols):
             logger.info(f"Training {i + 1}/{len(symbols)}: {symbol}")
             try:
-                results[symbol] = self.train_stock(symbol, start_date, end_date)
+                model, accuracy = self.train_stock(symbol, start_date, end_date)
+                if model is None:
+                    results[symbol] = {
+                        "status": "no_data",
+                        "reason": "No training data returned by feature pipeline",
+                        "accuracy": None,
+                        "model": None,
+                    }
+                else:
+                    results[symbol] = {
+                        "status": "success",
+                        "reason": "",
+                        "accuracy": accuracy,
+                        "model": model,
+                    }
             except Exception as e:
                 logger.error(f"Training failed for {symbol}: {e}")
-                results[symbol] = None
+                results[symbol] = {
+                    "status": "failed",
+                    "reason": str(e),
+                    "accuracy": None,
+                    "model": None,
+                }
         return results
 
     def load_models(self, symbol: str) -> tuple[EnsembleModel, StandardScaler, StandardScaler, int | None]:

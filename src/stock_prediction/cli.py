@@ -1,6 +1,8 @@
 """Click-based CLI entry point for stock prediction system."""
 
+import csv
 import click
+from pathlib import Path
 from rich.console import Console
 
 from stock_prediction.config import get_setting
@@ -34,8 +36,28 @@ def train(symbols: str | None, start_date: str | None, end_date: str | None,
     trainer = ModelTrainer(use_news=not no_news, use_llm=not no_llm)
     results = trainer.train_batch(symbol_list, start_date, end_date)
 
-    success = sum(1 for v in results.values() if v is not None)
+    success = sum(1 for v in results.values() if v["status"] == "success")
+    failed = [sym for sym, v in results.items() if v["status"] != "success"]
     console.print(f"\nTraining complete: {success}/{len(results)} stocks trained successfully")
+    for sym in failed:
+        r = results[sym]
+        console.print(f"[red]  {sym}: {r['status']} — {r['reason']}[/]")
+
+    # Write training summary CSV
+    reports_dir = Path("data/reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = reports_dir / "train_summary.csv"
+    with open(summary_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Symbol", "Status", "Val Accuracy", "Reason"])
+        for sym, r in results.items():
+            writer.writerow([
+                sym,
+                r["status"],
+                f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "",
+                r["reason"],
+            ])
+    console.print(f"[dim]Saved: {summary_path}[/dim]")
 
 
 @cli.command()
