@@ -34,7 +34,7 @@ class XGBoostPredictor:
             objective="multi:softprob",
             num_class=3,
             eval_metric="mlogloss",
-            use_label_encoder=False,
+            early_stopping_rounds=self.early_stopping_rounds,
             verbosity=0,
         )
         self.feature_names: list[str] = []
@@ -55,12 +55,7 @@ class XGBoostPredictor:
         if X_val is not None and y_val is not None:
             eval_set.append((X_val, y_val))
 
-        fit_kwargs = dict(eval_set=eval_set, verbose=False)
-        if X_val is not None and y_val is not None:
-            # Early stopping requires a validation set as the last eval_set entry
-            fit_kwargs["early_stopping_rounds"] = self.early_stopping_rounds
-
-        self.model.fit(X_train, y_train, **fit_kwargs)
+        self.model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
 
         # Get best iteration info
         results = self.model.evals_result()
