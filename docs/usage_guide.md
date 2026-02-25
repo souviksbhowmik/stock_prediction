@@ -89,36 +89,50 @@ stockpredict fetch-data -s RELIANCE.NS --start-date 2023-01-01
 
 ## Step 3: Train Models
 
-### `train` — Train LSTM + XGBoost Ensemble
+### `train` — Train Prediction Models
 
 **What it does:**
-Trains a per-symbol ML ensemble (LSTM neural network + XGBoost classifier) for each specified stock. For each symbol the pipeline:
+Trains one or more ML models (LSTM and/or XGBoost) per symbol. When multiple models are selected they are combined into a weighted ensemble at prediction time. For each symbol the pipeline:
 
-1. Fetches OHLCV data live from yfinance (from `start-date` or `2020-01-01` by default)
-2. Computes 22+ technical indicators (RSI, MACD, Bollinger Bands, ATR, OBV, VWAP, Stochastic, SMA/EMA crossovers)
-3. Optionally fetches Google News RSS articles, runs FinBERT sentiment analysis and spaCy NER to produce 18 news features
-4. Optionally calls the local Ollama LLM to generate 10 broker-style insight scores per stock
-5. Creates training labels from next-day returns (≥1% → BUY, ≤-1% → SELL, else HOLD)
-6. Builds 60-day rolling windows for the LSTM and tabular snapshots for XGBoost
-7. Splits chronologically (80% train / 20% validation — no shuffling to prevent data leakage)
-8. Trains the LSTM (Adam + CrossEntropyLoss, up to 50 epochs, early stopping patience=10)
-9. Trains XGBoost (multi:softprob, up to 500 trees, early stopping after 20 rounds)
-10. Saves all model artefacts to `data/models/{SYMBOL}/`
+1. Fetches OHLCV data live from yfinance (from `--start-date` or `2020-01-01` by default)
+2. Computes 30+ technical indicators (RSI, MACD, Bollinger Bands, ATR, OBV, VWAP, Stochastic, SMA/EMA crossovers, lag/momentum features)
+3. Adds NIFTY 50 market context (daily return, relative strength 1d/5d)
+4. Optionally fetches Google News RSS articles, runs FinBERT sentiment analysis and spaCy NER to produce 18 news features
+5. Optionally calls the local Ollama LLM to generate 10 broker-style insight scores per stock
+6. Creates training labels using the configured prediction horizon (default 5 trading days): ≥2.2% → BUY, ≤-2.2% → SELL, else HOLD
+7. Builds 60-day rolling windows for the LSTM and tabular snapshots for XGBoost
+8. Splits chronologically (80% train / 20% validation — no shuffling to prevent data leakage)
+9. Grid-searches hyperparameters for selected model(s) on the validation split (6 combinations each)
+10. Selects best hyperparameters by **balanced accuracy** (average recall across SELL/HOLD/BUY — robust to class imbalance)
+11. Retrains final model(s) on the **full dataset** using best hyperparameters (n_estimators / epochs scaled up proportionally)
+12. Saves all model artefacts to `data/models/{SYMBOL}/`
 
 > **Note:** `train` fetches its own data directly from yfinance. Running `fetch-data` beforehand is not required and has no effect on training.
+
+**Model options** (`--models` / `-m`):
+
+| Selection | Behaviour |
+|---|---|
+| `lstm` (default) | Train LSTM only — captures temporal patterns across 60-timestep sequences |
+| `xgboost` | Train XGBoost only — fast, interpretable feature importances |
+| `lstm,xgboost` | Train both; combine via per-stock dynamic weights derived from validation accuracy |
 
 **Dependencies:** None on prior steps. Requires internet access to yfinance and optionally Google News RSS and a running Ollama server.
 
 **Output:**
-- Console: Training progress and per-stock success/failure summary
-- Files written per symbol to `data/models/{SYMBOL}/`:
+- Console: training progress, hyperparameter search results, balanced val accuracy per symbol
+- `data/reports/train_summary.csv` — per-symbol status and balanced accuracy
+- Files written per symbol to `data/models/{SYMBOL}/` (only for selected models):
   - `lstm.pt` — PyTorch LSTM weights and architecture metadata
   - `xgboost.joblib` — trained XGBoost classifier with feature names
-  - `meta.joblib` — fitted StandardScalers, feature names, and `trained_at` timestamp
+  - `meta.joblib` — fitted StandardScalers, feature names, selected models, `trained_at` timestamp
 
 ```bash
 stockpredict train -s RELIANCE.NS,TCS.NS,SBIN.NS        # Specific stocks
 stockpredict train                                        # All NIFTY 50
+stockpredict train -m lstm                               # LSTM only (default)
+stockpredict train -m xgboost                            # XGBoost only
+stockpredict train -m lstm,xgboost                       # Ensemble of both
 stockpredict train -s RELIANCE.NS --no-news --no-llm     # Technical-only (faster)
 stockpredict train -s RELIANCE.NS --start-date 2023-01-01 --end-date 2024-12-31
 ```
@@ -132,10 +146,10 @@ stockpredict train -s RELIANCE.NS --start-date 2023-01-01 --end-date 2024-12-31
 **What it does:**
 Loads the trained models for each symbol and generates BUY / HOLD / SELL signals with confidence scores. For each symbol it:
 
-1. Loads `lstm.pt`, `xgboost.joblib`, and `meta.joblib` from `data/models/{SYMBOL}/` — warns if the model is more than 30 days old
+1. Loads model artefacts from `data/models/{SYMBOL}/` — warns if the model is more than 30 days old
 2. Fetches the latest price data from yfinance and builds current features (same pipeline as training)
 3. Scales features using the saved StandardScaler
-4. Runs the LSTM and XGBoost, then combines via weighted ensemble (40% LSTM + 60% XGBoost)
+4. Runs prediction using the model(s) the symbol was trained with; if multiple models were trained, combines them via per-stock dynamic weights saved during training
 5. Applies confidence thresholds: signals below 60% confidence are downgraded to HOLD; signals above 80% are upgraded to STRONG BUY / STRONG SELL
 6. Computes a short score (sell probability + RSI + MACD + SMA50) and flags short-selling candidates
 7. Runs the stock screener to produce top picks, sector momentum, and news alerts alongside the model signals
