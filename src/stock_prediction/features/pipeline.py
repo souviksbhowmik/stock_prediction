@@ -264,20 +264,29 @@ class FeaturePipeline:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> tuple[pd.DatetimeIndex, np.ndarray, pd.DataFrame | None, int]:
-        """Extract date index, close prices, and lag-safe features for Prophet.
+        """Extract date index, close prices, and features for Prophet.
 
-        Lag-safe features are those whose future values can be approximated by
-        carrying forward the last known value over a short horizon.
+        Two feature categories are included:
+        - Lag-safe regressors (CANDIDATE_REGRESSORS): future values approximated
+          by carry-forward.
+        - Lagged regressors ({col}_lag{horizon}): col.shift(horizon).  At
+          future step k, col_lag_h[t+k] = col[t+k-h] which is exactly known
+          from historical data — no approximation needed.
 
         Returns:
             (dates, close_values, feature_df, n_df)
-            - dates      : DatetimeIndex of all post-dropna rows
+            - dates       : DatetimeIndex of all post-dropna rows
             - close_values: Close prices aligned with dates
-            - feature_df : DataFrame of available lag-safe regressor columns,
-                           or None if none are present
-            - n_df       : total row count
+            - feature_df  : DataFrame of lag-safe + lagged regressor columns,
+                            or None if none are present
+            - n_df        : total row count
         """
-        from stock_prediction.models.prophet_model import CANDIDATE_REGRESSORS
+        from stock_prediction.models.prophet_model import (
+            CANDIDATE_REGRESSORS,
+            LAGGED_FEATURE_SOURCES,
+        )
+
+        horizon = int(get_setting("features", "prediction_horizon", default=1))
 
         df = self.build_features(symbol, start_date, end_date)
         if df.empty:
@@ -285,10 +294,36 @@ class FeaturePipeline:
                 "yfinance returned no price data — check ticker format or network"
             )
 
-        available = [c for c in CANDIDATE_REGRESSORS if c in df.columns]
-        feature_df = df[available].copy() if available else None
+        # Lag-safe columns (direct use, carry-forward for future)
+        lag_safe = [c for c in CANDIDATE_REGRESSORS if c in df.columns]
 
-        return df.index, df["Close"].values, feature_df, len(df)
+        # Lagged columns: shift source column back by horizon days
+        lag_cols: dict[str, pd.Series] = {}
+        for src in LAGGED_FEATURE_SOURCES:
+            if src in df.columns:
+                lag_name = f"{src}_lag{horizon}"
+                lag_cols[lag_name] = df[src].shift(horizon)
+
+        if not lag_safe and not lag_cols:
+            return df.index, df["Close"].values, None, len(df)
+
+        feature_df = df[lag_safe].copy() if lag_safe else pd.DataFrame(index=df.index)
+        for name, series in lag_cols.items():
+            feature_df[name] = series
+
+        # Drop rows with NaN introduced by lagging (first `horizon` rows)
+        feature_df = feature_df.dropna()
+        # Align df index to feature_df after dropna
+        df_aligned_index = df.index.intersection(feature_df.index)
+        feature_df = feature_df.loc[df_aligned_index]
+        close_values = df.loc[df_aligned_index, "Close"].values
+        dates = df_aligned_index
+
+        logger.info(
+            f"Prophet features for {symbol}: {list(feature_df.columns)} "
+            f"({len(feature_df)} rows)"
+        )
+        return dates, close_values, feature_df, len(feature_df)
 
     def prepare_training_data(
         self,

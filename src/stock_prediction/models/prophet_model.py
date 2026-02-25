@@ -39,6 +39,33 @@ CANDIDATE_REGRESSORS: list[str] = [
     "sentiment_compound",     # news sentiment (slow-moving, 6h cache)
 ]
 
+# Source columns for lagged features.  For each column listed here, the
+# pipeline will create a `{col}_lag{horizon}` column by shifting back by
+# `horizon` days.  Because col_lag_h[t+k] = col[t+k-h] for k=1..h, the
+# future values are EXACTLY known (all within historical data) — no
+# carry-forward approximation is needed.
+LAGGED_FEATURE_SOURCES: list[str] = [
+    "Volume",
+    "MACD",
+    "MACD_Signal",
+    "SMA_20",
+    "SMA_50",
+    "EMA_12",
+    "EMA_26",
+    "Stoch_K",
+    "Stoch_D",
+    "BB_Width",
+    "OBV",
+    "VWAP",
+    "Price_Momentum_5d",
+    "Volume_Ratio",
+    "Price_SMA20_Ratio",
+    "Price_SMA50_Ratio",
+    "SMA_20_50_Cross",
+    "RSI_Change_1d",
+    "MACD_Hist_Change_1d",
+]
+
 
 class ProphetPredictor:
     """Prophet-based time-series regressor that predicts future close prices.
@@ -78,6 +105,10 @@ class ProphetPredictor:
         self._changepoint_prior_scale: float = 0.1
         self._seasonality_prior_scale: float = 10.0
         self._regressors: list[str] = []   # active regressor column names
+        # Plot-support attributes populated by fit_full()
+        self._historical_yhat: np.ndarray | None = None
+        self._future_pred_closes: np.ndarray | None = None
+        self._future_pred_dates: pd.DatetimeIndex | None = None
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -297,9 +328,13 @@ class ProphetPredictor:
     ) -> None:
         """Retrain on the full dataset; cache the horizon-ahead probability.
 
-        Future regressor values (beyond last known date) are approximated by
-        carrying forward the last known row — valid for slowly-moving indicators
-        over a short horizon (1–10 trading days).
+        Two categories of future regressor values:
+        - Lag-safe regressors (CANDIDATE_REGRESSORS): carry-forward last known value.
+        - Lagged regressors (*_lag{h} columns): use exact historical values.
+          col_lag_h[t+k] = col[t+k-h] for k=1..h — all within known data.
+          At future step k: use feature_df[source_col].iloc[-(horizon-k+1)].
+          Specifically: step k=1 → feature_df[src].iloc[-horizon],
+                        step k=h → feature_df[src].iloc[-1]  (last known).
         """
         regressors = self._regressors   # determined during tune()
 
@@ -313,12 +348,30 @@ class ProphetPredictor:
         future_dates = pd.bdate_range(start=last_ds, periods=self.horizon + 1)[1:]
 
         if regressors and feature_df is not None:
-            # Carry-forward last known regressor values for future steps
-            last_vals = feature_df.iloc[-1]
-            future_rows = pd.DataFrame({
-                "ds": future_dates,
-                **{col: float(last_vals[col]) for col in regressors if col in feature_df.columns},
-            })
+            lag_suffix = f"_lag{self.horizon}"
+
+            # Build one row per future step
+            future_row_list = []
+            for k in range(1, self.horizon + 1):
+                row: dict = {"ds": future_dates[k - 1]}
+                for col in regressors:
+                    if col not in feature_df.columns:
+                        continue
+                    if col.endswith(lag_suffix):
+                        # Exact historical value: col_lag_h[t+k] = src[t+k-h]
+                        # index from end of feature_df: -(horizon - k + 1)
+                        src_idx = -(self.horizon - k + 1)
+                        src_col = col[: -len(lag_suffix)]
+                        if src_col in feature_df.columns:
+                            row[col] = float(feature_df[src_col].iloc[src_idx])
+                        else:
+                            row[col] = float(feature_df[col].iloc[-1])
+                    else:
+                        # Lag-safe: carry-forward last known value
+                        row[col] = float(feature_df[col].iloc[-1])
+                future_row_list.append(row)
+
+            future_rows = pd.DataFrame(future_row_list)
             hist_rows = df_full[["ds"] + [c for c in regressors if c in df_full.columns]]
             full_future = pd.concat([hist_rows, future_rows], ignore_index=True)
         else:
@@ -330,6 +383,7 @@ class ProphetPredictor:
             warnings.simplefilter("ignore")
             forecast = model.predict(full_future)
 
+        n_hist = len(dates_all)
         pred_close  = float(forecast["yhat"].iloc[-1])
         yhat_lower  = float(forecast["yhat_lower"].iloc[-1])
         yhat_upper  = float(forecast["yhat_upper"].iloc[-1])
@@ -340,6 +394,12 @@ class ProphetPredictor:
         sigma = max(interval_sigma, self._residual_std)
 
         self._current_proba = self._return_to_proba(pred_return, sigma)
+
+        # Cache for plot generation
+        self._historical_yhat = forecast["yhat"].values[:n_hist]
+        self._future_pred_closes = forecast["yhat"].values[n_hist:]
+        self._future_pred_dates = future_dates
+
         logger.info(
             f"Prophet full-data forecast: pred_return={pred_return:.4f}, "
             f"sigma={sigma:.4f}, regressors={regressors}, proba={self._current_proba}"

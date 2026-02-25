@@ -249,22 +249,26 @@ def _run_training_bg(
             progress["current_sym"] = sym
             progress["done"] = i
             try:
-                model, accuracy = trainer.train_stock(sym, sd, ed, selected_models)
+                model, accuracy, plot_paths = trainer.train_stock(sym, sd, ed, selected_models)
                 if model is None:
                     progress["results"][sym] = {
                         "status": "no_data", "accuracy": None, "reason": "No training data",
+                        "plot_paths": {},
                     }
                 else:
                     progress["results"][sym] = {
                         "status": "success", "accuracy": accuracy, "reason": "",
+                        "plot_paths": plot_paths,
                     }
             except ValueError as e:
                 progress["results"][sym] = {
                     "status": "no_data", "accuracy": None, "reason": str(e),
+                    "plot_paths": {},
                 }
             except Exception as e:
                 progress["results"][sym] = {
                     "status": "failed", "accuracy": None, "reason": str(e),
+                    "plot_paths": {},
                 }
             progress["done"] = i + 1
     except Exception as e:
@@ -303,6 +307,7 @@ def _add_sym_to_input(session_key: str, symbol: str) -> None:
 def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm):
     """Shared prediction logic — returns TradingSignal or raises."""
     from stock_prediction.features.pipeline import FeaturePipeline
+    from stock_prediction.config import get_setting
     import numpy as np
 
     ensemble, scaler, seq_scaler, model_age = trainer.load_models(symbol)
@@ -312,7 +317,8 @@ def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm):
     if df.empty:
         raise ValueError("No feature data returned")
 
-    label_cols = ["return_1d", "return_5d", "signal"]
+    horizon = int(get_setting("features", "prediction_horizon", default=1))
+    label_cols = {"return_1d", "return_5d", f"return_{horizon}d", "signal"}
     feature_cols = [c for c in df.columns if c not in label_cols]
     features = df[feature_cols].values
     seq_len = pipeline.sequence_length
@@ -680,24 +686,75 @@ def page_fetch_data() -> None:
                 st.error(f"Fetch error: {e}")
 
 
+# ─── Plot popup dialog ────────────────────────────────────────────────────────
+@st.dialog("Plot Viewer", width="large")
+def _show_plots_popup(symbol: str, plot_paths: dict) -> None:
+    """Modal dialog with interactive Plotly plots for train/val/pred."""
+    st.markdown(f"### {symbol} — Training Plots")
+    tab_tr, tab_val, tab_pred = st.tabs(["📊 Training Period", "📈 Train+Val Fit", "🔮 Prediction"])
+    for tab, key, label in [
+        (tab_tr,   "train_plot", "Training Period"),
+        (tab_val,  "val_plot",   "Train+Val Fit"),
+        (tab_pred, "pred_plot",  "Prediction"),
+    ]:
+        with tab:
+            path = plot_paths.get(key)
+            if path:
+                from pathlib import Path as _Path
+                p = _Path(path)
+                if p.exists():
+                    html = p.read_text(encoding="utf-8")
+                    st.components.v1.html(html, height=520, scrolling=False)
+                    st.download_button(
+                        label=f"⬇ Download {label} Plot",
+                        data=html.encode("utf-8"),
+                        file_name=f"{symbol}_{key}.html",
+                        mime="text/html",
+                        key=f"dl_{symbol}_{key}",
+                    )
+                else:
+                    st.info(f"Plot file not found: {path}")
+            else:
+                st.info(f"No {label} plot was generated for {symbol}.")
+
+
 # ─── Train ────────────────────────────────────────────────────────────────────
 def _render_train_results(results: dict) -> None:
     ok = sum(1 for v in results.values() if v["status"] == "success")
     st.success(f"Training complete: **{ok} / {len(results)}** stocks trained successfully")
-    rows = [
-        {
+
+    # Header row
+    hcols = st.columns([1.2, 1, 1.2, 3, 0.8])
+    for col, hdr in zip(hcols, ["Symbol", "Status", "Balanced Acc", "Reason", "Plots"]):
+        col.markdown(f"**{hdr}**")
+
+    # One row per symbol with a "View Plots" button
+    csv_rows = []
+    for sym, r in results.items():
+        rcols = st.columns([1.2, 1, 1.2, 3, 0.8])
+        rcols[0].write(sym)
+        status = r["status"]
+        status_css = {"success": "#16a34a", "no_data": "#d97706", "failed": "#dc2626"}.get(status, "#6b7280")
+        rcols[1].markdown(f'<span style="color:{status_css};font-weight:600">{status}</span>', unsafe_allow_html=True)
+        rcols[2].write(f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "—")
+        rcols[3].write(r.get("reason") or "—")
+        plot_paths = r.get("plot_paths") or {}
+        if plot_paths and status == "success":
+            if rcols[4].button("📊", key=f"plt_{sym}", help="View plots"):
+                _show_plots_popup(sym, plot_paths)
+        else:
+            rcols[4].write("—")
+        csv_rows.append({
             "Symbol":       sym,
-            "Status":       r["status"],
+            "Status":       status,
             "Balanced Acc": f"{r['accuracy']:.4f}" if r["accuracy"] is not None else "—",
-            "Reason":       r["reason"],
-        }
-        for sym, r in results.items()
-    ]
-    df = pd.DataFrame(rows)
-    _show_table(df, style_map={"Status": _color_status})
+            "Reason":       r.get("reason") or "",
+        })
+
+    df_csv = pd.DataFrame(csv_rows)
     st.download_button(
         label="⬇ Download CSV",
-        data=df.to_csv(index=False),
+        data=df_csv.to_csv(index=False),
         file_name="train_results.csv",
         mime="text/csv",
         key="tr_download",
@@ -926,24 +983,41 @@ def page_predict() -> None:
             )
 
     _section("Signal Table")
-    rows = [
-        {
-            "Symbol":          sig.symbol,
-            "Signal":          sig.signal,
-            "Confidence":      f"{sig.confidence:.1%}",
-            "BUY %":           f"{sig.probabilities.get('BUY', 0):.0%}",
-            "HOLD %":          f"{sig.probabilities.get('HOLD', 0):.0%}",
-            "SELL %":          f"{sig.probabilities.get('SELL', 0):.0%}",
-            "RSI":             f"{sig.technical_summary.get('RSI', 0):.0f}" if sig.technical_summary.get("RSI") else "—",
-            "Short?":          "Yes" if sig.is_short_candidate else "No",
-            "Weekly Outlook":  sig.weekly_outlook,
-        }
-        for sig in signals
-    ]
-    _show_table(
-        pd.DataFrame(rows),
-        style_map={"Signal": _color_signal, "Short?": _color_short},
-    )
+    # Header
+    pr_cols = st.columns([1, 1, 1, 0.7, 0.7, 0.7, 0.6, 0.6, 2, 0.7])
+    for col, hdr in zip(pr_cols, ["Symbol", "Signal", "Confidence", "BUY %", "HOLD %", "SELL %", "RSI", "Short?", "Weekly Outlook", "Plots"]):
+        col.markdown(f"**{hdr}**")
+    from pathlib import Path as _PPath
+    _plot_base = _PPath("data/plots")
+    for sig in signals:
+        sym_plots = _plot_base / sig.symbol.replace(".", "_")
+        pred_path = sym_plots / f"{sig.symbol}_pred_plot.html"
+        val_path  = sym_plots / f"{sig.symbol}_val_plot.html"
+        tr_path   = sym_plots / f"{sig.symbol}_train_plot.html"
+        has_plots = pred_path.exists()
+
+        rcols = st.columns([1, 1, 1, 0.7, 0.7, 0.7, 0.6, 0.6, 2, 0.7])
+        rcols[0].write(sig.symbol)
+        sig_css = {"STRONG BUY": "#166534", "BUY": "#16a34a", "HOLD": "#d97706",
+                   "SELL": "#dc2626", "STRONG SELL": "#7f1d1d"}.get(sig.signal, "#6b7280")
+        rcols[1].markdown(f'<span style="color:{sig_css};font-weight:700">{sig.signal}</span>', unsafe_allow_html=True)
+        rcols[2].write(f"{sig.confidence:.1%}")
+        rcols[3].write(f"{sig.probabilities.get('BUY', 0):.0%}")
+        rcols[4].write(f"{sig.probabilities.get('HOLD', 0):.0%}")
+        rcols[5].write(f"{sig.probabilities.get('SELL', 0):.0%}")
+        rcols[6].write(f"{sig.technical_summary.get('RSI', 0):.0f}" if sig.technical_summary.get("RSI") else "—")
+        short_css = "color:#dc2626;font-weight:600" if sig.is_short_candidate else ""
+        rcols[7].markdown(f'<span style="{short_css}">{"Yes" if sig.is_short_candidate else "No"}</span>', unsafe_allow_html=True)
+        rcols[8].write(sig.weekly_outlook or "—")
+        if has_plots:
+            if rcols[9].button("📊", key=f"pr_plt_{sig.symbol}", help="View plots"):
+                _show_plots_popup(sig.symbol, {
+                    "train_plot": str(tr_path),
+                    "val_plot":   str(val_path),
+                    "pred_plot":  str(pred_path),
+                })
+        else:
+            rcols[9].write("—")
 
 
 # ─── Analyze ──────────────────────────────────────────────────────────────────
@@ -1007,7 +1081,8 @@ def page_analyze() -> None:
                 )
                 if model_age and model_age > staleness:
                     st.warning(f"Model for {sym} is {model_age} days old — consider retraining.")
-                label_cols = ["return_1d", "return_5d", "signal"]
+                horizon_an = int(get_setting("features", "prediction_horizon", default=1))
+                label_cols = {"return_1d", "return_5d", f"return_{horizon_an}d", "signal"}
                 feature_cols = [c for c in df.columns if c not in label_cols]
                 tech = {
                     c: float(df[c].iloc[-1])

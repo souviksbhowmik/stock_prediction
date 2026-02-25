@@ -17,6 +17,7 @@ from stock_prediction.models.encoder_decoder_model import EncoderDecoderPredicto
 from stock_prediction.models.prophet_model import ProphetPredictor
 from stock_prediction.models.ensemble import EnsembleModel
 from stock_prediction.utils.logging import get_logger
+from stock_prediction.utils.plot_utils import generate_plots
 
 logger = get_logger("models.trainer")
 
@@ -150,14 +151,20 @@ class ModelTrainer:
                 use_encoder_decoder = False
                 selected_models = [m for m in selected_models if m != "encoder_decoder"]
 
-        # ── 1c. Prophet data ─────────────────────────────────────────────
+        # ── 1c. Prophet + plot data ──────────────────────────────────────
+        # prepare_prophet_data is always called — it provides (dates, close)
+        # needed for plot generation regardless of whether Prophet is selected.
         dates_all: np.ndarray | None = None
         close_all: np.ndarray | None = None
         prophet_feature_df = None
-        if use_prophet:
+        try:
             dates_all, close_all, prophet_feature_df, _ = self.pipeline.prepare_prophet_data(
                 symbol, start_date, end_date
             )
+        except Exception as e:
+            logger.warning(f"Could not fetch dates/close for {symbol}: {e}")
+        if not use_prophet:
+            prophet_feature_df = None  # don't use features if prophet not selected
 
         # ── 2. Train/val split ───────────────────────────────────────────
         split_idx = int(n_samples * self.train_split) if n_samples > 0 else 0
@@ -383,7 +390,51 @@ class ModelTrainer:
             selected_models, n_features,
         )
 
-        return ensemble, val_accuracy
+        # ── 8. Generate time-series plots ────────────────────────────────
+        plot_paths: dict[str, str] = {}
+        try:
+            ed_ratios_for_plot = None
+            if ed_final is not None and seq_reg is not None:
+                X_seq_reg_full_s = full_seq_scaler.transform(
+                    seq_reg.reshape(-1, n_features)
+                ).reshape(n_reg, seq_len, n_features)
+                ed_ratios_for_plot = ed_final.predict_ratios(X_seq_reg_full_s)
+
+            prophet_yhat_hist = (
+                prophet_final._historical_yhat if prophet_final is not None else None
+            )
+            prophet_pred_closes = (
+                prophet_final._future_pred_closes if prophet_final is not None else None
+            )
+            prophet_future_dates = (
+                prophet_final._future_pred_dates if prophet_final is not None else None
+            )
+
+            if dates_all is not None and close_all is not None:
+                plot_save_dir = Path(get_setting("models", "save_dir", default="data/models")).parent / "plots"
+                train_end_for_plot = (
+                    split_idx + (seq_len if sequences is not None else 0)
+                )
+                raw_paths = generate_plots(
+                    symbol=symbol,
+                    dates=dates_all,
+                    close=close_all,
+                    train_end_idx=train_end_for_plot,
+                    horizon=horizon,
+                    seq_len=seq_len if sequences is not None else 60,
+                    ed_pred_ratios=ed_ratios_for_plot,
+                    prophet_yhat_hist=prophet_yhat_hist,
+                    prophet_pred_closes=prophet_pred_closes,
+                    prophet_future_dates=prophet_future_dates,
+                    actual_signals=labels,
+                    save_dir=plot_save_dir,
+                )
+                plot_paths = {k: str(v) for k, v in raw_paths.items()}
+                logger.info(f"Plots saved for {symbol}: {list(plot_paths.keys())}")
+        except Exception as e:
+            logger.warning(f"Plot generation failed for {symbol}: {e}")
+
+        return ensemble, val_accuracy, plot_paths
 
     # =========================================================================
     # Hyperparameter tuning helpers
@@ -500,7 +551,7 @@ class ModelTrainer:
         for i, symbol in enumerate(symbols):
             logger.info(f"Training {i + 1}/{len(symbols)}: {symbol}")
             try:
-                model, accuracy = self.train_stock(
+                model, accuracy, plot_paths = self.train_stock(
                     symbol, start_date, end_date, selected_models
                 )
                 results[symbol] = {
@@ -508,6 +559,7 @@ class ModelTrainer:
                     "reason": "",
                     "accuracy": accuracy,
                     "model": model,
+                    "plot_paths": plot_paths,
                 }
             except ValueError as e:
                 logger.error(f"No usable data for {symbol}: {e}")
@@ -516,6 +568,7 @@ class ModelTrainer:
                     "reason": str(e),
                     "accuracy": None,
                     "model": None,
+                    "plot_paths": {},
                 }
             except Exception as e:
                 logger.error(f"Training failed for {symbol}: {e}")
@@ -524,6 +577,7 @@ class ModelTrainer:
                     "reason": str(e),
                     "accuracy": None,
                     "model": None,
+                    "plot_paths": {},
                 }
         return results
 
