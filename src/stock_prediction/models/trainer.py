@@ -73,6 +73,13 @@ class ModelTrainer:
         """
         logger.info(f"Training models for {symbol}")
 
+        model_mode = get_setting("models", "model_mode", default="lstm")
+        if model_mode not in ("lstm", "xgboost", "ensemble"):
+            raise ValueError(
+                f"models.model_mode must be 'lstm', 'xgboost', or 'ensemble', got '{model_mode}'"
+            )
+        logger.info(f"Model mode: {model_mode}")
+
         # ── 1. Build features ─────────────────────────────────────────────
         sequences, tabular, labels, feature_names = self.pipeline.prepare_training_data(
             symbol, start_date, end_date
@@ -112,47 +119,67 @@ class ModelTrainer:
         )
 
         # ── 4. Hyperparameter tuning on val split ─────────────────────────
-        logger.info(f"Tuning XGBoost hyperparameters for {symbol}...")
-        best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
-            X_tab_train_s, y_train, X_tab_val_s, y_val,
-            sample_weight=sample_weights_train,
-        )
+        best_xgb_params: dict = {}
+        best_n_estimators: int = 0
+        xgb_val_acc: float = 0.0
 
-        logger.info(f"Tuning LSTM hyperparameters for {symbol}...")
-        best_lstm_params, best_lstm_epochs, lstm_val_acc = self._tune_lstm(
-            X_seq_train_s, y_train, X_seq_val_s, y_val, n_features,
-            class_weights=class_weights,
-        )
+        best_lstm_params: dict = {}
+        best_lstm_epochs: int = 0
+        lstm_val_acc: float = 0.0
 
-        # Derive per-stock dynamic ensemble weights from individual val accuracies
-        total_acc = lstm_val_acc + xgb_val_acc
-        if total_acc > 0:
-            lstm_weight = lstm_val_acc / total_acc
-            xgb_weight = xgb_val_acc / total_acc
+        if model_mode in ("xgboost", "ensemble"):
+            logger.info(f"Tuning XGBoost hyperparameters for {symbol}...")
+            best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
+                X_tab_train_s, y_train, X_tab_val_s, y_val,
+                sample_weight=sample_weights_train,
+            )
+
+        if model_mode in ("lstm", "ensemble"):
+            logger.info(f"Tuning LSTM hyperparameters for {symbol}...")
+            best_lstm_params, best_lstm_epochs, lstm_val_acc = self._tune_lstm(
+                X_seq_train_s, y_train, X_seq_val_s, y_val, n_features,
+                class_weights=class_weights,
+            )
+
+        # Derive ensemble weights
+        if model_mode == "lstm":
+            lstm_weight, xgb_weight = 1.0, 0.0
+        elif model_mode == "xgboost":
+            lstm_weight, xgb_weight = 0.0, 1.0
         else:
-            lstm_weight = get_setting("models", "ensemble", "lstm_weight", default=0.4)
-            xgb_weight = get_setting("models", "ensemble", "xgboost_weight", default=0.6)
-        logger.info(
-            f"Dynamic ensemble weights for {symbol}: "
-            f"LSTM={lstm_weight:.3f} (balanced_acc={lstm_val_acc:.4f}), "
-            f"XGB={xgb_weight:.3f} (balanced_acc={xgb_val_acc:.4f})"
-        )
+            total_acc = lstm_val_acc + xgb_val_acc
+            if total_acc > 0:
+                lstm_weight = lstm_val_acc / total_acc
+                xgb_weight = xgb_val_acc / total_acc
+            else:
+                lstm_weight = get_setting("models", "ensemble", "lstm_weight", default=0.4)
+                xgb_weight = get_setting("models", "ensemble", "xgboost_weight", default=0.6)
+            logger.info(
+                f"Dynamic ensemble weights for {symbol}: "
+                f"LSTM={lstm_weight:.3f} (balanced_acc={lstm_val_acc:.4f}), "
+                f"XGB={xgb_weight:.3f} (balanced_acc={xgb_val_acc:.4f})"
+            )
 
-        # ── 5. Compute ensemble val accuracy with the best individual models
-        xgb_val = XGBoostPredictor(**best_xgb_params, n_estimators=best_n_estimators, early_stopping_rounds=None)
-        xgb_val.train(X_tab_train_s, y_train, feature_names=feature_names,
-                      sample_weight=sample_weights_train)
+        # ── 5. Compute val accuracy with best individual models ────────────
+        xgb_val_model: XGBoostPredictor | None = None
+        lstm_val_model: LSTMPredictor | None = None
 
-        lstm_val = LSTMPredictor(input_size=n_features, **best_lstm_params, epochs=best_lstm_epochs)
-        lstm_val.train(X_seq_train_s, y_train, class_weights=class_weights)
+        if model_mode in ("xgboost", "ensemble"):
+            xgb_val_model = XGBoostPredictor(**best_xgb_params, n_estimators=best_n_estimators, early_stopping_rounds=None)
+            xgb_val_model.train(X_tab_train_s, y_train, feature_names=feature_names,
+                                sample_weight=sample_weights_train)
 
-        ensemble_val = EnsembleModel(lstm_val, xgb_val, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
+        if model_mode in ("lstm", "ensemble"):
+            lstm_val_model = LSTMPredictor(input_size=n_features, **best_lstm_params, epochs=best_lstm_epochs)
+            lstm_val_model.train(X_seq_train_s, y_train, class_weights=class_weights)
+
+        ensemble_val = EnsembleModel(lstm_val_model, xgb_val_model, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
         val_preds = ensemble_val.predict(X_seq_val_s, X_tab_val_s)
         val_pred_labels = np.array([p.signal_idx for p in val_preds])
         val_accuracy = balanced_accuracy_score(y_val, val_pred_labels)
-        logger.info(f"Best ensemble balanced val accuracy for {symbol}: {val_accuracy:.4f}")
+        logger.info(f"Balanced val accuracy for {symbol} ({model_mode}): {val_accuracy:.4f}")
 
-        # ── 5. Retrain on the full dataset with best hyperparameters ──────
+        # ── 6. Retrain on the full dataset with best hyperparameters ──────
         logger.info(f"Retraining on full dataset for {symbol}...")
 
         # Refit scalers on ALL data (no leakage risk — predictions use these scalers)
@@ -168,27 +195,30 @@ class ModelTrainer:
         class_weights_full = compute_class_weight("balanced", classes=classes, y=labels)
         sample_weights_full = compute_sample_weight("balanced", y=labels)
 
-        # XGBoost: fixed n_estimators (no early stopping — no held-out set)
-        # Scale up proportionally since full data ~1/train_split times larger.
-        n_est_full = max(best_n_estimators, int(best_n_estimators / self.train_split))
-        xgb_final = XGBoostPredictor(
-            **best_xgb_params,
-            n_estimators=n_est_full,
-            early_stopping_rounds=None,
-        )
-        xgb_final.train(X_tab_full_s, labels, feature_names=feature_names,
-                        sample_weight=sample_weights_full)
+        xgb_final: XGBoostPredictor | None = None
+        lstm_final: LSTMPredictor | None = None
 
-        # LSTM: fixed epoch count (no early stopping)
-        epochs_full = max(best_lstm_epochs, int(best_lstm_epochs / self.train_split))
-        lstm_final = LSTMPredictor(
-            input_size=n_features, **best_lstm_params, epochs=epochs_full
-        )
-        lstm_final.train(X_seq_full_s, labels, class_weights=class_weights_full)
+        if model_mode in ("xgboost", "ensemble"):
+            # Scale up n_estimators proportionally since full data is ~1/train_split larger.
+            n_est_full = max(best_n_estimators, int(best_n_estimators / self.train_split))
+            xgb_final = XGBoostPredictor(
+                **best_xgb_params,
+                n_estimators=n_est_full,
+                early_stopping_rounds=None,
+            )
+            xgb_final.train(X_tab_full_s, labels, feature_names=feature_names,
+                            sample_weight=sample_weights_full)
+
+        if model_mode in ("lstm", "ensemble"):
+            epochs_full = max(best_lstm_epochs, int(best_lstm_epochs / self.train_split))
+            lstm_final = LSTMPredictor(
+                input_size=n_features, **best_lstm_params, epochs=epochs_full
+            )
+            lstm_final.train(X_seq_full_s, labels, class_weights=class_weights_full)
 
         ensemble = EnsembleModel(lstm_final, xgb_final, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
 
-        # ── 6. Save full-data models and scalers ──────────────────────────
+        # ── 7. Save full-data models and scalers ──────────────────────────
         self._save_models(
             symbol, lstm_final, xgb_final, full_scaler, full_seq_scaler,
             feature_names, lstm_weight, xgb_weight,
@@ -314,26 +344,36 @@ class ModelTrainer:
 
         Returns (ensemble, scaler, seq_scaler, model_age_days).
         model_age_days is None if the model has no trained_at timestamp.
+        Loads only the model files required by the saved model_mode.
         """
         model_dir = self.save_dir / symbol.replace(".", "_")
-
-        lstm_path = model_dir / "lstm.pt"
-        xgb_path = model_dir / "xgboost.joblib"
         meta_path = model_dir / "meta.joblib"
 
-        if not all(p.exists() for p in [lstm_path, xgb_path, meta_path]):
+        if not meta_path.exists():
             raise FileNotFoundError(f"Models not found for {symbol} in {model_dir}")
 
         meta = joblib.load(meta_path)
+        # Old models saved before model_mode was introduced have both files → treat as ensemble.
+        model_mode = meta.get("model_mode", "ensemble")
 
-        lstm = LSTMPredictor(input_size=meta["input_size"])
-        lstm.load(lstm_path)
+        lstm_path = model_dir / "lstm.pt"
+        xgb_path = model_dir / "xgboost.joblib"
 
-        xgb = XGBoostPredictor()
-        xgb.load(xgb_path)
+        lstm: LSTMPredictor | None = None
+        xgb: XGBoostPredictor | None = None
 
-        # Restore per-stock dynamic weights; fall back to config if loading an
-        # older model that was saved before dynamic weighting was introduced.
+        if model_mode in ("lstm", "ensemble"):
+            if not lstm_path.exists():
+                raise FileNotFoundError(f"LSTM model not found for {symbol} in {model_dir}")
+            lstm = LSTMPredictor(input_size=meta["input_size"])
+            lstm.load(lstm_path)
+
+        if model_mode in ("xgboost", "ensemble"):
+            if not xgb_path.exists():
+                raise FileNotFoundError(f"XGBoost model not found for {symbol} in {model_dir}")
+            xgb = XGBoostPredictor()
+            xgb.load(xgb_path)
+
         lstm_weight = meta.get("lstm_weight")
         xgb_weight = meta.get("xgb_weight")
         ensemble = EnsembleModel(lstm, xgb, lstm_weight=lstm_weight, xgboost_weight=xgb_weight)
@@ -349,8 +389,8 @@ class ModelTrainer:
     def _save_models(
         self,
         symbol: str,
-        lstm: LSTMPredictor,
-        xgb: XGBoostPredictor,
+        lstm: LSTMPredictor | None,
+        xgb: XGBoostPredictor | None,
         scaler: StandardScaler,
         seq_scaler: StandardScaler,
         feature_names: list[str],
@@ -360,15 +400,19 @@ class ModelTrainer:
         model_dir = self.save_dir / symbol.replace(".", "_")
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        lstm.save(model_dir / "lstm.pt")
-        xgb.save(model_dir / "xgboost.joblib")
+        if lstm is not None:
+            lstm.save(model_dir / "lstm.pt")
+        if xgb is not None:
+            xgb.save(model_dir / "xgboost.joblib")
+
         joblib.dump({
             "scaler": scaler,
             "seq_scaler": seq_scaler,
             "feature_names": feature_names,
-            "input_size": lstm.input_size,
+            "input_size": lstm.input_size if lstm is not None else None,
             "lstm_weight": lstm_weight,
             "xgb_weight": xgb_weight,
+            "model_mode": get_setting("models", "model_mode", default="lstm"),
             "trained_at": datetime.now().isoformat(),
         }, model_dir / "meta.joblib")
 

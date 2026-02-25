@@ -27,15 +27,21 @@ class EnsemblePrediction:
 
 
 class EnsembleModel:
-    """Weighted average ensemble of LSTM and XGBoost."""
+    """Weighted average ensemble of LSTM and XGBoost.
+
+    Either model may be None when running in single-model mode
+    (model_mode = "lstm" or "xgboost").  At least one must be provided.
+    """
 
     def __init__(
         self,
-        lstm: LSTMPredictor,
-        xgboost: XGBoostPredictor,
+        lstm: LSTMPredictor | None,
+        xgboost: XGBoostPredictor | None,
         lstm_weight: float | None = None,
         xgboost_weight: float | None = None,
     ):
+        if lstm is None and xgboost is None:
+            raise ValueError("At least one of lstm or xgboost must be provided")
         self.lstm = lstm
         self.xgboost = xgboost
         self.lstm_weight = lstm_weight if lstm_weight is not None else get_setting("models", "ensemble", "lstm_weight", default=0.4)
@@ -44,19 +50,29 @@ class EnsembleModel:
     def predict(
         self, X_seq: np.ndarray, X_tab: np.ndarray
     ) -> list[EnsemblePrediction]:
-        """Generate ensemble predictions.
+        """Generate predictions.
 
         Args:
             X_seq: LSTM input sequences, shape (N, seq_len, n_features)
             X_tab: XGBoost input tabular, shape (N, n_features)
-        """
-        lstm_probs = self.lstm.predict_proba(X_seq)
-        xgb_probs = self.xgboost.predict_proba(X_tab)
 
-        # Weighted average
-        ensemble_probs = (
-            self.lstm_weight * lstm_probs + self.xgboost_weight * xgb_probs
-        )
+        In single-model mode one of X_seq / X_tab is ignored.
+        """
+        if self.lstm is None:
+            # XGBoost only
+            xgb_probs = self.xgboost.predict_proba(X_tab)  # type: ignore[union-attr]
+            ensemble_probs = xgb_probs
+            lstm_probs = np.zeros_like(xgb_probs)
+        elif self.xgboost is None:
+            # LSTM only
+            lstm_probs = self.lstm.predict_proba(X_seq)
+            ensemble_probs = lstm_probs
+            xgb_probs = np.zeros_like(lstm_probs)
+        else:
+            # Weighted average
+            lstm_probs = self.lstm.predict_proba(X_seq)
+            xgb_probs = self.xgboost.predict_proba(X_tab)
+            ensemble_probs = self.lstm_weight * lstm_probs + self.xgboost_weight * xgb_probs
 
         predictions = []
         for i in range(len(ensemble_probs)):

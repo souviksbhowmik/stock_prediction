@@ -64,6 +64,7 @@ models:
   ensemble:
     lstm_weight: 0.4
     xgboost_weight: 0.6
+  model_mode: "lstm"  # "lstm", "xgboost", or "ensemble"
   save_dir: data/models
   train_split: 0.8
   staleness_warning_days: 30

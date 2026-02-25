@@ -266,9 +266,20 @@ These are the **search space defaults** for the XGBoost tuner.
 
 | Key | Default | Description |
 |---|---|---|
+| `model_mode` | `"lstm"` | Which model(s) to train and use for prediction. See options below. |
 | `save_dir` | `data/models` | Root directory where trained model files are saved (`lstm.pt`, `xgboost.joblib`, `meta.joblib` per symbol). |
 | `train_split` | `0.8` | Fraction of data used as the training split during hyperparameter tuning. The remaining 20% is the validation set. Final models are retrained on 100% of data. |
 | `staleness_warning_days` | `30` | If a saved model is older than this many days, the system warns that it may be stale and should be retrained. |
+
+**`model_mode` options:**
+
+| Value | Description |
+|---|---|
+| `"lstm"` | Train and predict using the LSTM only. Faster training, good at capturing temporal patterns in the 60-timestep feature sequences. |
+| `"xgboost"` | Train and predict using XGBoost only. Fast training, interpretable feature importances, no sequence context. |
+| `"ensemble"` | Train both models and combine their probability outputs using per-stock dynamic weights derived from individual validation accuracies. |
+
+> Changing `model_mode` requires retraining — existing saved models store the mode they were trained with and load correctly regardless of the current setting.
 
 ---
 
