@@ -183,6 +183,102 @@ class FeaturePipeline:
 
         return df
 
+    def prepare_regression_data(
+        self,
+        symbol: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
+        """Prepare regression data for encoder-decoder training.
+
+        Targets are price ratios: close[t+k] / close[t] for k=1..horizon.
+        The ratio is always positive and scale-invariant (1.0 = no change).
+
+        Loop bound: ``range(seq_len, n_df - horizon)`` so that
+        ``close_values[i + horizon]`` is always within the post-dropna array.
+
+        Returns:
+            (sequences, tabular, reg_targets, labels, feature_names)
+            - sequences  : (N, seq_len, n_features)
+            - tabular    : (N, n_features) — same features, row i
+            - reg_targets: (N, horizon)   — future price ratios
+            - labels     : (N,)           — classification signal (for reporting)
+            - feature_names: list of feature column names
+        """
+        df = self.build_features(symbol, start_date, end_date)
+        if df.empty:
+            raise ValueError(
+                "yfinance returned no price data — check ticker format or network"
+            )
+
+        horizon = int(get_setting("features", "prediction_horizon", default=1))
+        min_rows = self.sequence_length + horizon + 10
+        if len(df) < min_rows:
+            raise ValueError(
+                f"Only {len(df)} rows after feature build "
+                f"(need {min_rows} for seq_len={self.sequence_length}, horizon={horizon}); "
+                "use an earlier --start-date"
+            )
+
+        label_cols = {"return_1d", "return_5d", f"return_{horizon}d", "signal"}
+        feature_cols = [c for c in df.columns if c not in label_cols]
+
+        features = df[feature_cols].values          # (n_df, n_features)
+        labels = df["signal"].values                # (n_df,)
+        close_values = df["Close"].values           # (n_df,)
+        n_df = len(features)
+
+        sequences, tabular, reg_targets, seq_labels = [], [], [], []
+
+        # i is the *current* row (end of seq window, before the horizon period)
+        # We need close_values[i + horizon], so i < n_df - horizon
+        for i in range(self.sequence_length, n_df - horizon):
+            close_t = close_values[i]
+            ratios = np.array(
+                [close_values[i + k] / close_t for k in range(1, horizon + 1)],
+                dtype=np.float32,
+            )
+            sequences.append(features[i - self.sequence_length : i])
+            tabular.append(features[i])
+            reg_targets.append(ratios)
+            seq_labels.append(labels[i])
+
+        sequences = np.array(sequences, dtype=np.float32)
+        tabular = np.array(tabular, dtype=np.float32)
+        reg_targets = np.array(reg_targets, dtype=np.float32)
+        seq_labels = np.array(seq_labels, dtype=np.int64)
+
+        sequences = np.nan_to_num(sequences, nan=0.0, posinf=0.0, neginf=0.0)
+        tabular = np.nan_to_num(tabular, nan=0.0, posinf=0.0, neginf=0.0)
+        reg_targets = np.nan_to_num(reg_targets, nan=1.0, posinf=1.0, neginf=1.0)
+
+        logger.info(
+            f"Prepared regression data for {symbol}: "
+            f"sequences={sequences.shape}, reg_targets={reg_targets.shape}"
+        )
+        return sequences, tabular, reg_targets, seq_labels, feature_cols
+
+    def prepare_prophet_data(
+        self,
+        symbol: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, int]:
+        """Extract date index and close prices for Prophet training.
+
+        Returns:
+            (dates, close_values, n_df)
+            - dates      : DatetimeIndex of all post-dropna rows
+            - close_values: Close prices aligned with dates
+            - n_df       : total row count
+        """
+        df = self.build_features(symbol, start_date, end_date)
+        if df.empty:
+            raise ValueError(
+                "yfinance returned no price data — check ticker format or network"
+            )
+        return df.index, df["Close"].values, len(df)
+
     def prepare_training_data(
         self,
         symbol: str,

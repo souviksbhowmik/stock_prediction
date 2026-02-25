@@ -26,8 +26,12 @@ def cli(log_level: str):
 @click.option("--no-llm", is_flag=True, help="Disable LLM features")
 @click.option(
     "--models", "-m", default=None,
-    help="Comma-separated models to train: lstm, xgboost, or lstm,xgboost for ensemble. "
-         "Defaults to config setting models.selected_models.",
+    help=(
+        "Comma-separated models to train. "
+        "Available: lstm, xgboost, encoder_decoder, prophet. "
+        "Multiple entries → weighted ensemble (e.g. --models lstm,encoder_decoder). "
+        "Defaults to config setting models.selected_models."
+    ),
 )
 def train(symbols: str | None, start_date: str | None, end_date: str | None,
           no_news: bool, no_llm: bool, models: str | None):
