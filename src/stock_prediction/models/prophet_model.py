@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import joblib
 import numpy as np
@@ -16,12 +15,9 @@ from stock_prediction.config import get_setting
 from stock_prediction.features.pipeline import HORIZON_THRESHOLDS
 from stock_prediction.utils.logging import get_logger
 
-if TYPE_CHECKING:
-    pass
-
 logger = get_logger("models.prophet")
 
-# Hyperparameter grid for Prophet changepoint flexibility
+# Hyperparameter grid for Prophet changepoint flexibility.
 _PROPHET_PARAM_GRID = [
     {"changepoint_prior_scale": 0.05, "seasonality_prior_scale": 10.0},
     {"changepoint_prior_scale": 0.10, "seasonality_prior_scale": 10.0},
@@ -29,24 +25,44 @@ _PROPHET_PARAM_GRID = [
     {"changepoint_prior_scale": 0.50, "seasonality_prior_scale": 10.0},
 ]
 
+# Lag-safe exogenous regressors whose future values can be approximated by
+# carrying forward the last known value over the prediction horizon.
+# Only columns that actually exist in the feature DataFrame will be used.
+CANDIDATE_REGRESSORS: list[str] = [
+    "RSI",                    # momentum oscillator (0–100)
+    "MACD_Histogram",         # trend momentum
+    "BB_PB",                  # Bollinger Band %B (price position in band)
+    "ATR",                    # volatility measure
+    "NIFTY_Return_1d",        # market direction (last known)
+    "Relative_Strength_1d",   # stock vs market (last known)
+    "Relative_Strength_5d",   # 5-day relative strength (last known)
+    "sentiment_compound",     # news sentiment (slow-moving, 6h cache)
+]
+
 
 class ProphetPredictor:
     """Prophet-based time-series regressor that predicts future close prices.
 
-    Training approach:
-    - Fits Prophet on close price history up to the training split.
-    - Forecasts forward through validation dates + horizon ahead.
-    - For each validation sample, derives the predicted return from the
-      forecast and bins it into SELL / HOLD / BUY.
-    - Balanced accuracy over the validation set is used for ensemble weighting.
+    Exogenous regressors
+    --------------------
+    A subset of ``CANDIDATE_REGRESSORS`` that are present in the feature
+    DataFrame is added as Prophet regressors.  For the horizon-ahead forecast,
+    their future values are approximated by carry-forward of the last known
+    value — reasonable for slowly-moving indicators over 1–10 trading days.
 
-    Inference approach:
-    - Fits Prophet on the full close price history.
-    - Forecasts ``horizon`` days ahead from the last available date.
-    - Converts the predicted return to a probability vector via Gaussian CDF
-      using the residual std estimated from validation residuals.
-    - Returns a single (3,) probability that is broadcast over all N samples
-      in the ensemble (Prophet gives one signal per horizon, not per historical row).
+    Training approach
+    -----------------
+    - Fits Prophet on close price history up to the training split, augmented
+      with the available lag-safe regressors.
+    - Forecasts forward through all dates using actual feature values for
+      historical rows and carry-forward for future rows.
+    - Balanced accuracy (per-sample binned predictions) is used for ensemble
+      weighting.
+
+    Inference approach
+    ------------------
+    - Full-data retrain; horizon-ahead forecast uses last known regressor values.
+    - A single (3,) probability vector is broadcast over all N ensemble samples.
     """
 
     def __init__(self, horizon: int | None = None):
@@ -56,34 +72,54 @@ class ProphetPredictor:
         self._thresholds: tuple[float, float] = HORIZON_THRESHOLDS.get(
             self.horizon, (0.022, -0.022)
         )
-        self._model = None          # fitted Prophet instance
+        self._model = None
         self._residual_std: float = 0.02
-        # Latest single forecast cached after full-data training
-        self._current_proba: np.ndarray = np.array([1/3, 1/3, 1/3], dtype=np.float32)
+        self._current_proba: np.ndarray = np.array([1 / 3, 1 / 3, 1 / 3], dtype=np.float32)
         self._changepoint_prior_scale: float = 0.1
         self._seasonality_prior_scale: float = 10.0
+        self._regressors: list[str] = []   # active regressor column names
 
-    # ── Helpers ───────────────────────────────────────────────────────────
+    # ── Internal helpers ──────────────────────────────────────────────────
 
     @staticmethod
-    def _build_prophet_df(dates: pd.DatetimeIndex | np.ndarray,
-                          close: np.ndarray) -> pd.DataFrame:
+    def _strip_tz(dates: pd.DatetimeIndex | np.ndarray) -> pd.DatetimeIndex:
         idx = pd.DatetimeIndex(dates)
-        # Prophet requires timezone-naive ds column
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
-        return pd.DataFrame({"ds": idx, "y": close.astype(float)})
+        return idx.tz_localize(None) if idx.tz is not None else idx
 
-    def _fit(self, df_train: pd.DataFrame,
-             changepoint_prior_scale: float = 0.1,
-             seasonality_prior_scale: float = 10.0):
-        """Fit a Prophet model on the given training DataFrame."""
+    def _build_df(
+        self,
+        dates: pd.DatetimeIndex | np.ndarray,
+        close: np.ndarray,
+        feature_df: pd.DataFrame | None = None,
+        regressors: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Build a Prophet-compatible DataFrame with ds, y, and optional regressors."""
+        df = pd.DataFrame({
+            "ds": self._strip_tz(dates),
+            "y":  close.astype(float),
+        })
+        if regressors and feature_df is not None:
+            for col in regressors:
+                if col in feature_df.columns:
+                    vals = feature_df[col].values
+                    # Align length in case of a slice mismatch
+                    df[col] = vals[: len(df)]
+        return df
+
+    def _fit(
+        self,
+        df_train: pd.DataFrame,
+        regressors: list[str],
+        changepoint_prior_scale: float = 0.1,
+        seasonality_prior_scale: float = 10.0,
+    ):
+        """Fit Prophet with optional regressors; returns the fitted model."""
         try:
-            from prophet import Prophet  # lazy import to surface install errors early
+            from prophet import Prophet
         except ImportError as exc:
             raise ImportError(
-                "prophet is not installed. Run: "
-                "conda run -n stock_prediction pip install prophet"
+                "prophet is not installed. "
+                "Run: conda run -n stock_prediction pip install prophet"
             ) from exc
 
         with warnings.catch_warnings():
@@ -95,15 +131,26 @@ class ProphetPredictor:
                 changepoint_prior_scale=changepoint_prior_scale,
                 seasonality_prior_scale=seasonality_prior_scale,
             )
+            for reg in regressors:
+                if reg in df_train.columns:
+                    model.add_regressor(reg)
             model.fit(df_train)
         return model
 
-    def _forecast_on_dates(self, model, dates: pd.DatetimeIndex | np.ndarray) -> pd.DataFrame:
-        """Run Prophet prediction on a specific set of dates."""
-        idx = pd.DatetimeIndex(dates)
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
-        future = pd.DataFrame({"ds": idx})
+    def _forecast(
+        self,
+        model,
+        dates: pd.DatetimeIndex | np.ndarray,
+        feature_df: pd.DataFrame | None = None,
+        regressors: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Forecast on a set of specific dates, including regressor values."""
+        future = pd.DataFrame({"ds": self._strip_tz(dates)})
+        if regressors and feature_df is not None:
+            for col in regressors:
+                if col in feature_df.columns:
+                    vals = feature_df[col].values
+                    future[col] = vals[: len(future)]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return model.predict(future)
@@ -114,37 +161,46 @@ class ProphetPredictor:
         self,
         dates_all: pd.DatetimeIndex | np.ndarray,
         close_all: np.ndarray,
-        train_end_idx: int,          # exclusive; Prophet is trained on [:train_end_idx]
-        seq_len: int,                # number of leading context rows (for index alignment)
+        train_end_idx: int,
+        seq_len: int,
+        feature_df: pd.DataFrame | None = None,
         changepoint_prior_scale: float = 0.1,
         seasonality_prior_scale: float = 10.0,
     ) -> dict:
-        """Fit Prophet on training slice and compute validation balanced accuracy.
+        """Fit Prophet on the training slice and compute validation balanced accuracy.
 
         Args:
-            dates_all      : DatetimeIndex for all rows in the post-dropna df.
-            close_all      : Close prices for all rows (same length as dates_all).
-            train_end_idx  : Row index (in df space) where training ends (exclusive).
-                             Equals seq_len + n_train in the feature-sample split.
-            seq_len        : Sequence length (used to map feature samples → df rows).
+            dates_all      : DatetimeIndex for all post-dropna rows.
+            close_all      : Close prices aligned with dates_all.
+            train_end_idx  : Exclusive end index for training (= seq_len + n_train).
+            seq_len        : Sequence length, for context only (not used internally).
+            feature_df     : DataFrame of lag-safe features aligned with dates_all.
+                             Only CANDIDATE_REGRESSORS columns present are used.
         """
         n_df = len(close_all)
 
-        df_train = self._build_prophet_df(
-            dates_all[:train_end_idx], close_all[:train_end_idx]
+        # Select whichever candidate columns are actually available
+        regressors = (
+            [c for c in CANDIDATE_REGRESSORS if feature_df is not None and c in feature_df.columns]
+            if feature_df is not None else []
         )
-        model = self._fit(df_train, changepoint_prior_scale, seasonality_prior_scale)
 
-        # Forecast on ALL actual dates (train + val)
-        forecast = self._forecast_on_dates(model, dates_all)
-        # forecast['yhat'][i] = Prophet's estimate for row i
-        # For i < train_end_idx → in-sample fit; i >= train_end_idx → out-of-sample
+        df_train = self._build_df(
+            dates_all[:train_end_idx],
+            close_all[:train_end_idx],
+            feature_df.iloc[:train_end_idx] if feature_df is not None else None,
+            regressors,
+        )
+        model = self._fit(df_train, regressors, changepoint_prior_scale, seasonality_prior_scale)
+
+        # Forecast on ALL actual dates using actual feature values
+        forecast = self._forecast(model, dates_all, feature_df, regressors)
 
         balanced_acc = self._compute_val_accuracy(
             close_all, forecast["yhat"].values, train_end_idx, n_df
         )
 
-        # Estimate residual std from val residuals (final-step only)
+        # Estimate residual std from val horizon-step residuals
         pred_returns, true_returns = [], []
         for i in range(train_end_idx, n_df):
             j = i + self.horizon
@@ -160,12 +216,13 @@ class ProphetPredictor:
             self._residual_std = max(float(np.std(residuals)), 1e-4)
 
         self._model = model
+        self._regressors = regressors
         self._changepoint_prior_scale = changepoint_prior_scale
         self._seasonality_prior_scale = seasonality_prior_scale
 
         logger.info(
-            f"Prophet train_end_idx={train_end_idx}, "
-            f"cps={changepoint_prior_scale}, balanced_acc={balanced_acc:.4f}, "
+            f"Prophet train_end={train_end_idx}, cps={changepoint_prior_scale}, "
+            f"regressors={regressors}, balanced_acc={balanced_acc:.4f}, "
             f"residual_std={self._residual_std:.4f}"
         )
         return {"balanced_accuracy": balanced_acc}
@@ -188,19 +245,16 @@ class ProphetPredictor:
             if close_all[i] <= 0:
                 continue
             pred_r = yhat[j] / close_all[i] - 1
-            true_r = close_all[j] / close_all[i] - 1
-
-            pred_labels.append(2 if pred_r >= buy_thresh
-                                else (0 if pred_r <= sell_thresh else 1))
-            true_labels.append(2 if true_r >= buy_thresh
-                                else (0 if true_r <= sell_thresh else 1))
+            true_r  = close_all[j] / close_all[i] - 1
+            pred_labels.append(2 if pred_r >= buy_thresh else (0 if pred_r <= sell_thresh else 1))
+            true_labels.append(2 if true_r >= buy_thresh else (0 if true_r <= sell_thresh else 1))
 
         if len(pred_labels) < 5:
             return 1.0 / 3.0
 
         return float(balanced_accuracy_score(true_labels, pred_labels))
 
-    # ── Tune grid ─────────────────────────────────────────────────────────
+    # ── Hyperparameter tuning ─────────────────────────────────────────────
 
     def tune(
         self,
@@ -208,15 +262,15 @@ class ProphetPredictor:
         close_all: np.ndarray,
         train_end_idx: int,
         seq_len: int,
+        feature_df: pd.DataFrame | None = None,
     ) -> tuple[float, float, float]:
-        """Grid-search Prophet changepoint_prior_scale; return (best_cps, best_sps, best_acc)."""
-        best_acc = -1.0
-        best_cps = 0.1
-        best_sps = 10.0
+        """Grid-search changepoint_prior_scale; return (best_cps, best_sps, best_acc)."""
+        best_acc, best_cps, best_sps = -1.0, 0.1, 10.0
 
         for params in _PROPHET_PARAM_GRID:
             result = self.train(
                 dates_all, close_all, train_end_idx, seq_len,
+                feature_df=feature_df,
                 changepoint_prior_scale=params["changepoint_prior_scale"],
                 seasonality_prior_scale=params["seasonality_prior_scale"],
             )
@@ -227,7 +281,10 @@ class ProphetPredictor:
                 best_cps = params["changepoint_prior_scale"]
                 best_sps = params["seasonality_prior_scale"]
 
-        logger.info(f"Best Prophet: cps={best_cps}, sps={best_sps}, balanced_acc={best_acc:.4f}")
+        logger.info(
+            f"Best Prophet: cps={best_cps}, sps={best_sps}, "
+            f"regressors={self._regressors}, balanced_acc={best_acc:.4f}"
+        )
         return best_cps, best_sps, best_acc
 
     # ── Full-data retrain ──────────────────────────────────────────────────
@@ -236,57 +293,75 @@ class ProphetPredictor:
         self,
         dates_all: pd.DatetimeIndex | np.ndarray,
         close_all: np.ndarray,
+        feature_df: pd.DataFrame | None = None,
     ) -> None:
-        """Retrain on the complete dataset and cache the horizon-ahead forecast."""
-        df_full = self._build_prophet_df(dates_all, close_all)
-        model = self._fit(df_full, self._changepoint_prior_scale,
-                          self._seasonality_prior_scale)
+        """Retrain on the full dataset; cache the horizon-ahead probability.
+
+        Future regressor values (beyond last known date) are approximated by
+        carrying forward the last known row — valid for slowly-moving indicators
+        over a short horizon (1–10 trading days).
+        """
+        regressors = self._regressors   # determined during tune()
+
+        df_full = self._build_df(dates_all, close_all, feature_df, regressors)
+        model = self._fit(df_full, regressors,
+                          self._changepoint_prior_scale, self._seasonality_prior_scale)
         self._model = model
 
-        # Forecast horizon days beyond the last date
+        # Build future dataframe: all historical dates + horizon future business days
+        last_ds = self._strip_tz(dates_all)[-1]
+        future_dates = pd.bdate_range(start=last_ds, periods=self.horizon + 1)[1:]
+
+        if regressors and feature_df is not None:
+            # Carry-forward last known regressor values for future steps
+            last_vals = feature_df.iloc[-1]
+            future_rows = pd.DataFrame({
+                "ds": future_dates,
+                **{col: float(last_vals[col]) for col in regressors if col in feature_df.columns},
+            })
+            hist_rows = df_full[["ds"] + [c for c in regressors if c in df_full.columns]]
+            full_future = pd.concat([hist_rows, future_rows], ignore_index=True)
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                full_future = model.make_future_dataframe(periods=self.horizon, freq="B")
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            future = model.make_future_dataframe(periods=self.horizon, freq="B")
-            forecast = model.predict(future)
+            forecast = model.predict(full_future)
 
-        # Cached forecast for the horizon-ahead step
-        pred_close = float(forecast["yhat"].iloc[-1])
-        yhat_lower = float(forecast["yhat_lower"].iloc[-1])
-        yhat_upper = float(forecast["yhat_upper"].iloc[-1])
-        last_close = float(close_all[-1])
+        pred_close  = float(forecast["yhat"].iloc[-1])
+        yhat_lower  = float(forecast["yhat_lower"].iloc[-1])
+        yhat_upper  = float(forecast["yhat_upper"].iloc[-1])
+        last_close  = float(close_all[-1])
 
         pred_return = pred_close / last_close - 1
-        # Convert prediction interval width → sigma in return space
-        sigma = max(((yhat_upper - yhat_lower) / 3.92) / max(last_close, 1e-8),
-                    self._residual_std)
+        interval_sigma = ((yhat_upper - yhat_lower) / 3.92) / max(last_close, 1e-8)
+        sigma = max(interval_sigma, self._residual_std)
 
         self._current_proba = self._return_to_proba(pred_return, sigma)
         logger.info(
             f"Prophet full-data forecast: pred_return={pred_return:.4f}, "
-            f"sigma={sigma:.4f}, proba={self._current_proba}"
+            f"sigma={sigma:.4f}, regressors={regressors}, proba={self._current_proba}"
         )
 
     # ── Prediction ────────────────────────────────────────────────────────
 
     def _return_to_proba(self, pred_return: float, sigma: float) -> np.ndarray:
-        """Convert a scalar predicted return → (3,) SELL/HOLD/BUY probabilities."""
         buy_thresh, sell_thresh = self._thresholds
         p_sell = float(norm.cdf(sell_thresh, loc=pred_return, scale=sigma))
-        p_buy = float(1.0 - norm.cdf(buy_thresh, loc=pred_return, scale=sigma))
+        p_buy  = float(1.0 - norm.cdf(buy_thresh, loc=pred_return, scale=sigma))
         p_hold = float(np.clip(1.0 - p_sell - p_buy, 0.0, 1.0))
-        probs = np.array([p_sell, p_hold, p_buy], dtype=np.float32)
-        return probs / max(probs.sum(), 1e-8)
+        probs  = np.array([p_sell, p_hold, p_buy], dtype=np.float32)
+        return probs / max(float(probs.sum()), 1e-8)
 
     def predict_proba_current(self) -> np.ndarray:
-        """Return the cached horizon-ahead probability vector (3,)."""
         return self._current_proba.copy()
 
     def predict_proba(self, N: int) -> np.ndarray:
-        """Broadcast the single forecast probability to (N, 3)."""
         return np.tile(self._current_proba, (N, 1))
 
     def predict(self, N: int) -> np.ndarray:
-        """Return class labels (0=SELL, 1=HOLD, 2=BUY) broadcast to (N,)."""
         return np.full(N, int(np.argmax(self._current_proba)), dtype=np.int64)
 
     # ── Persistence ───────────────────────────────────────────────────────
@@ -296,22 +371,24 @@ class ProphetPredictor:
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
             {
-                "model": self._model,
-                "horizon": self.horizon,
-                "residual_std": self._residual_std,
-                "current_proba": self._current_proba,
+                "model":                   self._model,
+                "horizon":                 self.horizon,
+                "residual_std":            self._residual_std,
+                "current_proba":           self._current_proba,
                 "changepoint_prior_scale": self._changepoint_prior_scale,
                 "seasonality_prior_scale": self._seasonality_prior_scale,
+                "regressors":              self._regressors,
             },
             path,
         )
 
     def load(self, path: str | Path) -> None:
         data = joblib.load(path)
-        self._model = data["model"]
-        self.horizon = data.get("horizon", self.horizon)
-        self._residual_std = data.get("residual_std", self._residual_std)
-        self._current_proba = data.get("current_proba", self._current_proba)
+        self._model                   = data["model"]
+        self.horizon                  = data.get("horizon", self.horizon)
+        self._residual_std            = data.get("residual_std", self._residual_std)
+        self._current_proba           = data.get("current_proba", self._current_proba)
         self._changepoint_prior_scale = data.get("changepoint_prior_scale", 0.1)
         self._seasonality_prior_scale = data.get("seasonality_prior_scale", 10.0)
-        self._thresholds = HORIZON_THRESHOLDS.get(self.horizon, (0.022, -0.022))
+        self._regressors              = data.get("regressors", [])
+        self._thresholds              = HORIZON_THRESHOLDS.get(self.horizon, (0.022, -0.022))

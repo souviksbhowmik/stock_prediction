@@ -153,8 +153,9 @@ class ModelTrainer:
         # ── 1c. Prophet data ─────────────────────────────────────────────
         dates_all: np.ndarray | None = None
         close_all: np.ndarray | None = None
+        prophet_feature_df = None
         if use_prophet:
-            dates_all, close_all, _ = self.pipeline.prepare_prophet_data(
+            dates_all, close_all, prophet_feature_df, _ = self.pipeline.prepare_prophet_data(
                 symbol, start_date, end_date
             )
 
@@ -259,7 +260,8 @@ class ModelTrainer:
             train_end_idx = split_idx + (seq_len if sequences is not None else 0)
             prophet_tuner = ProphetPredictor(horizon=horizon)
             best_prophet_cps, best_prophet_sps, prophet_val_acc = prophet_tuner.tune(
-                dates_all, close_all, train_end_idx, seq_len
+                dates_all, close_all, train_end_idx, seq_len,
+                feature_df=prophet_feature_df,
             )
 
         # ── 5. Derive ensemble weights ────────────────────────────────────
@@ -359,7 +361,8 @@ class ModelTrainer:
             prophet_final._changepoint_prior_scale = best_prophet_cps
             prophet_final._seasonality_prior_scale = best_prophet_sps
             prophet_final._residual_std = prophet_tuner._residual_std
-            prophet_final.fit_full(dates_all, close_all)
+            prophet_final._regressors   = prophet_tuner._regressors
+            prophet_final.fit_full(dates_all, close_all, feature_df=prophet_feature_df)
 
         ensemble = EnsembleModel(
             lstm=lstm_final,

@@ -263,21 +263,32 @@ class FeaturePipeline:
         symbol: str,
         start_date: str | None = None,
         end_date: str | None = None,
-    ) -> tuple[pd.DatetimeIndex, np.ndarray, int]:
-        """Extract date index and close prices for Prophet training.
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, pd.DataFrame | None, int]:
+        """Extract date index, close prices, and lag-safe features for Prophet.
+
+        Lag-safe features are those whose future values can be approximated by
+        carrying forward the last known value over a short horizon.
 
         Returns:
-            (dates, close_values, n_df)
+            (dates, close_values, feature_df, n_df)
             - dates      : DatetimeIndex of all post-dropna rows
             - close_values: Close prices aligned with dates
+            - feature_df : DataFrame of available lag-safe regressor columns,
+                           or None if none are present
             - n_df       : total row count
         """
+        from stock_prediction.models.prophet_model import CANDIDATE_REGRESSORS
+
         df = self.build_features(symbol, start_date, end_date)
         if df.empty:
             raise ValueError(
                 "yfinance returned no price data — check ticker format or network"
             )
-        return df.index, df["Close"].values, len(df)
+
+        available = [c for c in CANDIDATE_REGRESSORS if c in df.columns]
+        feature_df = df[available].copy() if available else None
+
+        return df.index, df["Close"].values, feature_df, len(df)
 
     def prepare_training_data(
         self,
