@@ -9,6 +9,7 @@ from stock_prediction.config import get_setting
 from stock_prediction.data import get_provider
 from stock_prediction.features.technical import add_technical_indicators
 from stock_prediction.features.news_based import merge_news_features, merge_llm_features
+from stock_prediction.features.financial import FinancialFeatureGenerator
 from stock_prediction.news.news_features import NewsFeatureGenerator
 from stock_prediction.llm import get_llm_provider
 from stock_prediction.llm.news_analyzer import BrokerNewsAnalyzer
@@ -38,10 +39,18 @@ HORIZON_THRESHOLDS: dict[int, tuple[float, float]] = {
 class FeaturePipeline:
     """Build full feature matrix for model training/prediction."""
 
-    def __init__(self, use_news: bool = True, use_llm: bool = True):
+    def __init__(
+        self,
+        use_news: bool = True,
+        use_llm: bool = True,
+        use_financials: bool = True,
+    ):
         self.data_provider = get_provider(get_setting("data", "provider", default="yfinance"))
         self.use_news = use_news
         self.use_llm = use_llm
+        self.use_financials = use_financials and bool(
+            get_setting("features", "use_financials", default=True)
+        )
         self.sequence_length = get_setting("features", "sequence_length", default=60)
 
         if use_news:
@@ -54,6 +63,12 @@ class FeaturePipeline:
             except Exception as e:
                 logger.warning(f"LLM initialization failed: {e}. Disabling LLM features.")
                 self.use_llm = False
+        if self.use_financials:
+            self.financial_generator = FinancialFeatureGenerator(
+                announcement_lag_days=int(
+                    get_setting("features", "financial_announcement_lag_days", default=45)
+                )
+            )
 
     def build_features(
         self,
@@ -94,6 +109,13 @@ class FeaturePipeline:
 
         # Step 5: Market context (NIFTY 50 relative strength)
         df = self._add_market_context(df, start_date, end_date)
+
+        # Step 5b: Quarterly financial report features
+        if self.use_financials:
+            try:
+                df = self.financial_generator.merge_financial_features(df, symbol)
+            except Exception as e:
+                logger.warning(f"Financial features failed for {symbol}: {e}")
 
         # Step 6: Create labels
         df = self._add_labels(df)
@@ -295,7 +317,18 @@ class FeaturePipeline:
             )
 
         # Lag-safe columns (direct use, carry-forward for future)
-        lag_safe = [c for c in CANDIDATE_REGRESSORS if c in df.columns]
+        # Also include fin_* ratio columns (quarterly step functions — carry-
+        # forward is correct between report dates) and report aging features
+        # (carry-forward is a good approximation over a short 1-10d horizon).
+        fin_cols = [
+            c for c in df.columns
+            if c.startswith("fin_")
+            or c in {"report_age_days", "report_effect", "report_freshness",
+                     "days_to_next_report"}
+        ]
+        lag_safe = list(dict.fromkeys(
+            [c for c in CANDIDATE_REGRESSORS if c in df.columns] + fin_cols
+        ))
 
         # Lagged columns: shift source column back by horizon days
         lag_cols: dict[str, pd.Series] = {}

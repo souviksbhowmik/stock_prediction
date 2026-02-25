@@ -59,8 +59,15 @@ _ED_PARAM_GRID: list[dict] = [
 class ModelTrainer:
     """Train and persist prediction models for each stock."""
 
-    def __init__(self, use_news: bool = True, use_llm: bool = True):
-        self.pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm)
+    def __init__(
+        self,
+        use_news: bool = True,
+        use_llm: bool = True,
+        use_financials: bool = True,
+    ):
+        self.pipeline = FeaturePipeline(
+            use_news=use_news, use_llm=use_llm, use_financials=use_financials
+        )
         self.save_dir = Path(get_setting("models", "save_dir", default="data/models"))
         self.train_split = get_setting("models", "train_split", default=0.8)
 

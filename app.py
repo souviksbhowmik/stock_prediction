@@ -236,13 +236,14 @@ def _run_training_bg(
     ed: str | None,
     use_news: bool,
     use_llm: bool,
+    use_financials: bool,
     selected_models: list[str],
     progress: dict,
 ) -> None:
     """Runs in a daemon thread — keeps going even if the user navigates away."""
     try:
         from stock_prediction.models.trainer import ModelTrainer
-        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm)
+        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
         for i, sym in enumerate(symbol_list):
             if progress.get("cancelled"):
                 break
@@ -304,14 +305,14 @@ def _add_sym_to_input(session_key: str, symbol: str) -> None:
     st.session_state[session_key] = ",".join(existing)
 
 
-def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm):
+def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm, use_financials=True):
     """Shared prediction logic — returns TradingSignal or raises."""
     from stock_prediction.features.pipeline import FeaturePipeline
     from stock_prediction.config import get_setting
     import numpy as np
 
     ensemble, scaler, seq_scaler, model_age = trainer.load_models(symbol)
-    pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm)
+    pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
     df = pipeline.build_features(symbol)
 
     if df.empty:
@@ -834,7 +835,7 @@ def page_train() -> None:
     with col2:
         end_date = st.date_input("End Date", value=None, key="tr_end")
 
-    col3, col4, col5 = st.columns(3)
+    col3, col4, col5, col6 = st.columns(4)
     with col3:
         from stock_prediction.models.trainer import AVAILABLE_MODELS
         selected_models = st.multiselect(
@@ -850,6 +851,11 @@ def page_train() -> None:
         use_news = st.checkbox("News features", value=True, key="tr_news")
     with col5:
         use_llm = st.checkbox("LLM features", value=True, key="tr_llm")
+    with col6:
+        use_financials = st.checkbox(
+            "Financial features", value=True, key="tr_fin",
+            help="Quarterly P&L / balance sheet ratios + report aging features"
+        )
 
     if st.button("▶ Start Training", type="primary", key="tr_run"):
         symbol_list = _parse_symbols(symbols_input)
@@ -880,6 +886,7 @@ def page_train() -> None:
                 str(end_date) if end_date else None,
                 use_news,
                 use_llm,
+                use_financials,
                 selected_models,
                 progress,
             ),
@@ -910,11 +917,13 @@ def page_predict() -> None:
         placeholder="e.g. RELIANCE.NS,TCS.NS",
         key="pr_syms",
     )
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         use_news = st.checkbox("News features", value=True, key="pr_news")
     with col2:
         use_llm = st.checkbox("LLM features", value=True, key="pr_llm")
+    with col3:
+        use_fin_pr = st.checkbox("Financial features", value=True, key="pr_fin")
 
     if st.button("▶ Run Predict", type="primary", key="pr_run"):
         symbol_list = _parse_symbols(symbols_input)
@@ -938,7 +947,7 @@ def page_predict() -> None:
                 for symbol in symbol_list:
                     try:
                         sig, model_age, _ = _predict_for_symbol(
-                            symbol, trainer, signal_gen, use_news, use_llm
+                            symbol, trainer, signal_gen, use_news, use_llm, use_fin_pr
                         )
                         if model_age and model_age > staleness:
                             warn_msgs.append(
@@ -1027,13 +1036,15 @@ def page_analyze() -> None:
         "Single-stock deep dive: model signal, LLM broker scores, and recent headlines."
     )
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     with col1:
         symbol = st.text_input("Symbol", placeholder="e.g. RELIANCE.NS", key="an_sym")
     with col2:
         use_news = st.checkbox("News", value=True, key="an_news")
     with col3:
         use_llm = st.checkbox("LLM", value=True, key="an_llm")
+    with col4:
+        use_fin_an = st.checkbox("Financials", value=True, key="an_fin")
 
     if not st.button("▶ Analyze", type="primary", key="an_run") or not symbol.strip():
         return
@@ -1077,7 +1088,7 @@ def page_analyze() -> None:
                 staleness = get_setting("models", "staleness_warning_days", default=30)
                 # _predict_for_symbol returns the base signal; re-generate with LLM context
                 _, model_age, df = _predict_for_symbol(
-                    sym, trainer, signal_gen, use_news, use_llm
+                    sym, trainer, signal_gen, use_news, use_llm, use_fin_an
                 )
                 if model_age and model_age > staleness:
                     st.warning(f"Model for {sym} is {model_age} days old — consider retraining.")

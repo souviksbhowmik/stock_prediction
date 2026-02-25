@@ -44,6 +44,11 @@ features:
     stoch_period: 14
   sequence_length: 60
   prediction_horizon: 5  # trading days ahead to predict; must be 1-10
+  # Quarterly financial report features
+  use_financials: true
+  financial_announcement_lag_days: 45  # days after quarter-end before results assumed available
+                                        # (used when actual announcement date is unknown)
+                                        # Typical for NIFTY 50: 30-60 days; 45 is conservative
 
 models:
   lstm:
