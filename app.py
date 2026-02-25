@@ -236,6 +236,7 @@ def _run_training_bg(
     ed: str | None,
     use_news: bool,
     use_llm: bool,
+    selected_models: list[str],
     progress: dict,
 ) -> None:
     """Runs in a daemon thread — keeps going even if the user navigates away."""
@@ -248,7 +249,7 @@ def _run_training_bg(
             progress["current_sym"] = sym
             progress["done"] = i
             try:
-                model, accuracy = trainer.train_stock(sym, sd, ed)
+                model, accuracy = trainer.train_stock(sym, sd, ed, selected_models)
                 if model is None:
                     progress["results"][sym] = {
                         "status": "no_data", "accuracy": None, "reason": "No training data",
@@ -698,8 +699,8 @@ def _render_train_results(results: dict) -> None:
 def page_train() -> None:
     st.title("🧠 Train — Model Training")
     st.caption(
-        "Trains an LSTM + XGBoost ensemble for each symbol. "
-        "Trained models are saved to `data/models/`. "
+        "Trains models for each symbol and saves them to `data/models/`. "
+        "Select one or more models below — multiple selections use ensemble (weighted average). "
         "**Training runs in the background — you can freely navigate to other pages.**"
     )
 
@@ -762,20 +763,36 @@ def page_train() -> None:
         key="tr_syms",
     )
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Start Date", value=None, key="tr_start")
     with col2:
         end_date = st.date_input("End Date", value=None, key="tr_end")
+
+    col3, col4, col5 = st.columns(3)
     with col3:
-        use_news = st.checkbox("News features", value=True, key="tr_news")
+        from stock_prediction.models.trainer import AVAILABLE_MODELS
+        selected_models = st.multiselect(
+            "Models to train",
+            options=AVAILABLE_MODELS,
+            default=["lstm"],
+            key="tr_models",
+            help="Select one or more. Multiple selections → ensemble (weighted average).",
+        )
+        if len(selected_models) > 1:
+            st.caption("Ensemble mode: models will be weighted by validation accuracy.")
     with col4:
+        use_news = st.checkbox("News features", value=True, key="tr_news")
+    with col5:
         use_llm = st.checkbox("LLM features", value=True, key="tr_llm")
 
     if st.button("▶ Start Training", type="primary", key="tr_run"):
         symbol_list = _parse_symbols(symbols_input)
         if not symbol_list:
             st.warning("Please enter at least one symbol.")
+            return
+        if not selected_models:
+            st.warning("Please select at least one model.")
             return
 
         progress: dict = {
@@ -798,6 +815,7 @@ def page_train() -> None:
                 str(end_date) if end_date else None,
                 use_news,
                 use_llm,
+                selected_models,
                 progress,
             ),
             daemon=True,

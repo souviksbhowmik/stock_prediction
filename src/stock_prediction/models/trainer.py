@@ -18,6 +18,10 @@ from stock_prediction.utils.logging import get_logger
 
 logger = get_logger("models.trainer")
 
+# Models that can be selected for training.  Add new model IDs here as they
+# are implemented (e.g. "random_forest", "transformer").
+AVAILABLE_MODELS: list[str] = ["lstm", "xgboost"]
+
 # ---------------------------------------------------------------------------
 # Hyperparameter search grids
 # XGBoost: tune max_depth and learning_rate (most impactful); subsample and
@@ -56,15 +60,21 @@ class ModelTrainer:
         symbol: str,
         start_date: str | None = None,
         end_date: str | None = None,
+        selected_models: list[str] | None = None,
     ) -> tuple[EnsembleModel | None, float | None]:
         """Train models for a single stock.
 
+        Args:
+            selected_models: Which models to train, e.g. ["lstm"] or ["lstm", "xgboost"].
+                             Multiple models → weighted ensemble.  Defaults to
+                             config setting ``models.selected_models``.
+
         Pipeline:
           1. Build features and do a chronological 80/20 split.
-          2. Grid-search hyperparameters for XGBoost and LSTM using the val split.
-          3. Report ensemble val accuracy from the best combination.
+          2. Grid-search hyperparameters for selected model(s) using the val split.
+          3. Report val balanced-accuracy.
           4. Refit scalers on the *full* dataset.
-          5. Retrain final XGBoost and LSTM on full data with the best hyperparams
+          5. Retrain final model(s) on full data with the best hyperparams
              (n_estimators / epochs scaled up proportionally to the larger dataset).
           6. Save the full-data models and scalers.
 
@@ -73,12 +83,21 @@ class ModelTrainer:
         """
         logger.info(f"Training models for {symbol}")
 
-        model_mode = get_setting("models", "model_mode", default="lstm")
-        if model_mode not in ("lstm", "xgboost", "ensemble"):
+        if selected_models is None:
+            selected_models = list(get_setting("models", "selected_models", default=["lstm"]))
+        # Normalise and validate
+        selected_models = [m.strip().lower() for m in selected_models]
+        invalid = [m for m in selected_models if m not in AVAILABLE_MODELS]
+        if invalid:
             raise ValueError(
-                f"models.model_mode must be 'lstm', 'xgboost', or 'ensemble', got '{model_mode}'"
+                f"Unknown model(s): {invalid}. Available: {AVAILABLE_MODELS}"
             )
-        logger.info(f"Model mode: {model_mode}")
+        if not selected_models:
+            raise ValueError("selected_models must contain at least one model.")
+
+        use_lstm = "lstm" in selected_models
+        use_xgboost = "xgboost" in selected_models
+        logger.info(f"Selected models for {symbol}: {selected_models}")
 
         # ── 1. Build features ─────────────────────────────────────────────
         sequences, tabular, labels, feature_names = self.pipeline.prepare_training_data(
@@ -127,26 +146,22 @@ class ModelTrainer:
         best_lstm_epochs: int = 0
         lstm_val_acc: float = 0.0
 
-        if model_mode in ("xgboost", "ensemble"):
+        if use_xgboost:
             logger.info(f"Tuning XGBoost hyperparameters for {symbol}...")
             best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
                 X_tab_train_s, y_train, X_tab_val_s, y_val,
                 sample_weight=sample_weights_train,
             )
 
-        if model_mode in ("lstm", "ensemble"):
+        if use_lstm:
             logger.info(f"Tuning LSTM hyperparameters for {symbol}...")
             best_lstm_params, best_lstm_epochs, lstm_val_acc = self._tune_lstm(
                 X_seq_train_s, y_train, X_seq_val_s, y_val, n_features,
                 class_weights=class_weights,
             )
 
-        # Derive ensemble weights
-        if model_mode == "lstm":
-            lstm_weight, xgb_weight = 1.0, 0.0
-        elif model_mode == "xgboost":
-            lstm_weight, xgb_weight = 0.0, 1.0
-        else:
+        # Derive weights — dynamic when ensemble, fixed 1.0 for single-model
+        if use_lstm and use_xgboost:
             total_acc = lstm_val_acc + xgb_val_acc
             if total_acc > 0:
                 lstm_weight = lstm_val_acc / total_acc
@@ -159,17 +174,21 @@ class ModelTrainer:
                 f"LSTM={lstm_weight:.3f} (balanced_acc={lstm_val_acc:.4f}), "
                 f"XGB={xgb_weight:.3f} (balanced_acc={xgb_val_acc:.4f})"
             )
+        elif use_lstm:
+            lstm_weight, xgb_weight = 1.0, 0.0
+        else:
+            lstm_weight, xgb_weight = 0.0, 1.0
 
         # ── 5. Compute val accuracy with best individual models ────────────
         xgb_val_model: XGBoostPredictor | None = None
         lstm_val_model: LSTMPredictor | None = None
 
-        if model_mode in ("xgboost", "ensemble"):
+        if use_xgboost:
             xgb_val_model = XGBoostPredictor(**best_xgb_params, n_estimators=best_n_estimators, early_stopping_rounds=None)
             xgb_val_model.train(X_tab_train_s, y_train, feature_names=feature_names,
                                 sample_weight=sample_weights_train)
 
-        if model_mode in ("lstm", "ensemble"):
+        if use_lstm:
             lstm_val_model = LSTMPredictor(input_size=n_features, **best_lstm_params, epochs=best_lstm_epochs)
             lstm_val_model.train(X_seq_train_s, y_train, class_weights=class_weights)
 
@@ -177,7 +196,7 @@ class ModelTrainer:
         val_preds = ensemble_val.predict(X_seq_val_s, X_tab_val_s)
         val_pred_labels = np.array([p.signal_idx for p in val_preds])
         val_accuracy = balanced_accuracy_score(y_val, val_pred_labels)
-        logger.info(f"Balanced val accuracy for {symbol} ({model_mode}): {val_accuracy:.4f}")
+        logger.info(f"Balanced val accuracy for {symbol} {selected_models}: {val_accuracy:.4f}")
 
         # ── 6. Retrain on the full dataset with best hyperparameters ──────
         logger.info(f"Retraining on full dataset for {symbol}...")
@@ -198,7 +217,7 @@ class ModelTrainer:
         xgb_final: XGBoostPredictor | None = None
         lstm_final: LSTMPredictor | None = None
 
-        if model_mode in ("xgboost", "ensemble"):
+        if use_xgboost:
             # Scale up n_estimators proportionally since full data is ~1/train_split larger.
             n_est_full = max(best_n_estimators, int(best_n_estimators / self.train_split))
             xgb_final = XGBoostPredictor(
@@ -209,7 +228,7 @@ class ModelTrainer:
             xgb_final.train(X_tab_full_s, labels, feature_names=feature_names,
                             sample_weight=sample_weights_full)
 
-        if model_mode in ("lstm", "ensemble"):
+        if use_lstm:
             epochs_full = max(best_lstm_epochs, int(best_lstm_epochs / self.train_split))
             lstm_final = LSTMPredictor(
                 input_size=n_features, **best_lstm_params, epochs=epochs_full
@@ -221,7 +240,7 @@ class ModelTrainer:
         # ── 7. Save full-data models and scalers ──────────────────────────
         self._save_models(
             symbol, lstm_final, xgb_final, full_scaler, full_seq_scaler,
-            feature_names, lstm_weight, xgb_weight,
+            feature_names, lstm_weight, xgb_weight, selected_models,
         )
 
         return ensemble, val_accuracy
@@ -298,8 +317,12 @@ class ModelTrainer:
         symbols: list[str],
         start_date: str | None = None,
         end_date: str | None = None,
+        selected_models: list[str] | None = None,
     ) -> dict[str, dict]:
         """Train models for multiple stocks.
+
+        Args:
+            selected_models: Passed through to each train_stock call.
 
         Returns a dict mapping symbol to a result dict with keys:
           status   : 'success' | 'no_data' | 'failed'
@@ -311,7 +334,7 @@ class ModelTrainer:
         for i, symbol in enumerate(symbols):
             logger.info(f"Training {i + 1}/{len(symbols)}: {symbol}")
             try:
-                model, accuracy = self.train_stock(symbol, start_date, end_date)
+                model, accuracy = self.train_stock(symbol, start_date, end_date, selected_models)
                 results[symbol] = {
                     "status": "success",
                     "reason": "",
@@ -353,8 +376,18 @@ class ModelTrainer:
             raise FileNotFoundError(f"Models not found for {symbol} in {model_dir}")
 
         meta = joblib.load(meta_path)
-        # Old models saved before model_mode was introduced have both files → treat as ensemble.
-        model_mode = meta.get("model_mode", "ensemble")
+
+        # Resolve which models were saved — handle two legacy formats:
+        #   selected_models: ["lstm", "xgboost"]  (current)
+        #   model_mode: "lstm" | "xgboost" | "ensemble"  (previous commit)
+        #   <neither>  → both files present → treat as ensemble
+        selected_models: list[str] = meta.get("selected_models", [])
+        if not selected_models:
+            old_mode = meta.get("model_mode", "ensemble")
+            if old_mode == "ensemble":
+                selected_models = ["lstm", "xgboost"]
+            else:
+                selected_models = [old_mode]
 
         lstm_path = model_dir / "lstm.pt"
         xgb_path = model_dir / "xgboost.joblib"
@@ -362,13 +395,13 @@ class ModelTrainer:
         lstm: LSTMPredictor | None = None
         xgb: XGBoostPredictor | None = None
 
-        if model_mode in ("lstm", "ensemble"):
+        if "lstm" in selected_models:
             if not lstm_path.exists():
                 raise FileNotFoundError(f"LSTM model not found for {symbol} in {model_dir}")
             lstm = LSTMPredictor(input_size=meta["input_size"])
             lstm.load(lstm_path)
 
-        if model_mode in ("xgboost", "ensemble"):
+        if "xgboost" in selected_models:
             if not xgb_path.exists():
                 raise FileNotFoundError(f"XGBoost model not found for {symbol} in {model_dir}")
             xgb = XGBoostPredictor()
@@ -396,6 +429,7 @@ class ModelTrainer:
         feature_names: list[str],
         lstm_weight: float,
         xgb_weight: float,
+        selected_models: list[str],
     ) -> None:
         model_dir = self.save_dir / symbol.replace(".", "_")
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -412,7 +446,7 @@ class ModelTrainer:
             "input_size": lstm.input_size if lstm is not None else None,
             "lstm_weight": lstm_weight,
             "xgb_weight": xgb_weight,
-            "model_mode": get_setting("models", "model_mode", default="lstm"),
+            "selected_models": selected_models,
             "trained_at": datetime.now().isoformat(),
         }, model_dir / "meta.joblib")
 

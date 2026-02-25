@@ -24,17 +24,33 @@ def cli(log_level: str):
 @click.option("--end-date", default=None, help="Training end date (YYYY-MM-DD)")
 @click.option("--no-news", is_flag=True, help="Disable news features")
 @click.option("--no-llm", is_flag=True, help="Disable LLM features")
+@click.option(
+    "--models", "-m", default=None,
+    help="Comma-separated models to train: lstm, xgboost, or lstm,xgboost for ensemble. "
+         "Defaults to config setting models.selected_models.",
+)
 def train(symbols: str | None, start_date: str | None, end_date: str | None,
-          no_news: bool, no_llm: bool):
+          no_news: bool, no_llm: bool, models: str | None):
     """Train prediction models for specified stocks."""
-    from stock_prediction.models.trainer import ModelTrainer
+    from stock_prediction.models.trainer import ModelTrainer, AVAILABLE_MODELS
     from stock_prediction.utils.constants import NIFTY_50_TICKERS
+
+    # Parse model selection
+    selected_models: list[str] | None = None
+    if models:
+        selected_models = [m.strip().lower() for m in models.split(",")]
+        invalid = [m for m in selected_models if m not in AVAILABLE_MODELS]
+        if invalid:
+            console.print(f"[red]Unknown model(s): {invalid}. Available: {AVAILABLE_MODELS}[/]")
+            return
+        mode_label = "+".join(selected_models) + (" (ensemble)" if len(selected_models) > 1 else "")
+        console.print(f"Model selection: [bold]{mode_label}[/]")
 
     symbol_list = symbols.split(",") if symbols else NIFTY_50_TICKERS
     console.print(f"Training models for {len(symbol_list)} stocks...")
 
     trainer = ModelTrainer(use_news=not no_news, use_llm=not no_llm)
-    results = trainer.train_batch(symbol_list, start_date, end_date)
+    results = trainer.train_batch(symbol_list, start_date, end_date, selected_models)
 
     success = sum(1 for v in results.values() if v["status"] == "success")
     failed = [sym for sym, v in results.items() if v["status"] != "success"]
@@ -49,7 +65,7 @@ def train(symbols: str | None, start_date: str | None, end_date: str | None,
     summary_path = reports_dir / "train_summary.csv"
     with open(summary_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Symbol", "Status", "Val Accuracy", "Reason"])
+        writer.writerow(["Symbol", "Status", "Balanced Acc", "Reason"])
         for sym, r in results.items():
             writer.writerow([
                 sym,

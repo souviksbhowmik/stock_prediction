@@ -266,20 +266,22 @@ These are the **search space defaults** for the XGBoost tuner.
 
 | Key | Default | Description |
 |---|---|---|
-| `model_mode` | `"lstm"` | Which model(s) to train and use for prediction. See options below. |
+| `selected_models` | `["lstm"]` | List of models to train and use for prediction. Multiple entries → ensemble (weighted average). See options below. |
 | `save_dir` | `data/models` | Root directory where trained model files are saved (`lstm.pt`, `xgboost.joblib`, `meta.joblib` per symbol). |
 | `train_split` | `0.8` | Fraction of data used as the training split during hyperparameter tuning. The remaining 20% is the validation set. Final models are retrained on 100% of data. |
 | `staleness_warning_days` | `30` | If a saved model is older than this many days, the system warns that it may be stale and should be retrained. |
 
-**`model_mode` options:**
+**`selected_models` options:**
 
 | Value | Description |
 |---|---|
-| `"lstm"` | Train and predict using the LSTM only. Faster training, good at capturing temporal patterns in the 60-timestep feature sequences. |
-| `"xgboost"` | Train and predict using XGBoost only. Fast training, interpretable feature importances, no sequence context. |
-| `"ensemble"` | Train both models and combine their probability outputs using per-stock dynamic weights derived from individual validation accuracies. |
+| `["lstm"]` | LSTM only. Captures temporal patterns across the 60-timestep feature sequences. |
+| `["xgboost"]` | XGBoost only. Fast training, interpretable feature importances, no sequence context. |
+| `["lstm", "xgboost"]` | Ensemble — both models trained; probability outputs combined using per-stock dynamic weights derived from individual validation accuracies. |
 
-> Changing `model_mode` requires retraining — existing saved models store the mode they were trained with and load correctly regardless of the current setting.
+Can also be overridden at runtime via CLI (`--models lstm,xgboost`) or the Train UI (multiselect).
+
+> Changing `selected_models` requires retraining — each saved model records what was trained and loads the correct files regardless of the current config.
 
 ---
 
