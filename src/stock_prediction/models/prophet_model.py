@@ -68,7 +68,11 @@ class ProphetPredictor:
     @staticmethod
     def _build_prophet_df(dates: pd.DatetimeIndex | np.ndarray,
                           close: np.ndarray) -> pd.DataFrame:
-        return pd.DataFrame({"ds": pd.DatetimeIndex(dates), "y": close.astype(float)})
+        idx = pd.DatetimeIndex(dates)
+        # Prophet requires timezone-naive ds column
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        return pd.DataFrame({"ds": idx, "y": close.astype(float)})
 
     def _fit(self, df_train: pd.DataFrame,
              changepoint_prior_scale: float = 0.1,
@@ -96,7 +100,10 @@ class ProphetPredictor:
 
     def _forecast_on_dates(self, model, dates: pd.DatetimeIndex | np.ndarray) -> pd.DataFrame:
         """Run Prophet prediction on a specific set of dates."""
-        future = pd.DataFrame({"ds": pd.DatetimeIndex(dates)})
+        idx = pd.DatetimeIndex(dates)
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        future = pd.DataFrame({"ds": idx})
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return model.predict(future)
