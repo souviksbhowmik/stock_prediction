@@ -120,9 +120,22 @@ class FeaturePipeline:
         # Step 6: Create labels
         df = self._add_labels(df)
 
-        # Replace inf values (e.g. from pct_change on zero volume) with NaN,
-        # then drop all rows that still contain NaN or inf.
+        # Replace inf values (e.g. from pct_change on zero volume) with NaN.
         df = df.replace([float("inf"), float("-inf")], float("nan"))
+
+        # Financial/aging columns are NaN for rows before the first quarterly
+        # report — fill with 0.0 so the global dropna() below doesn't discard
+        # years of OHLCV history that precede the earliest available report.
+        _fin_aging = {"report_age_days", "report_effect", "report_freshness",
+                      "days_to_next_report"}
+        fin_fill_cols = [
+            c for c in df.columns
+            if c.startswith("fin_") or c in _fin_aging
+        ]
+        if fin_fill_cols:
+            df[fin_fill_cols] = df[fin_fill_cols].fillna(0.0)
+
+        # Drop rows where technical indicators or labels are still NaN.
         df = df.dropna()
 
         logger.info(f"Built features for {symbol}: {df.shape}")
@@ -344,8 +357,24 @@ class FeaturePipeline:
         for name, series in lag_cols.items():
             feature_df[name] = series
 
-        # Drop rows with NaN introduced by lagging (first `horizon` rows)
-        feature_df = feature_df.dropna()
+        # Fill fin_*/aging NaN with 0 (pre-report rows already handled in
+        # build_features, but be defensive here for direct callers).
+        _fin_aging = {"report_age_days", "report_effect", "report_freshness",
+                      "days_to_next_report"}
+        fin_fill_here = [
+            c for c in feature_df.columns
+            if c.startswith("fin_") or c in _fin_aging
+        ]
+        if fin_fill_here:
+            feature_df[fin_fill_here] = feature_df[fin_fill_here].fillna(0.0)
+
+        # Drop only the first `horizon` rows where lagged columns are NaN.
+        # Avoid dropna() over all columns — that would discard pre-report rows.
+        if lag_cols:
+            feature_df = feature_df.dropna(subset=list(lag_cols.keys()))
+        else:
+            feature_df = feature_df.dropna()
+
         # Align df index to feature_df after dropna
         df_aligned_index = df.index.intersection(feature_df.index)
         feature_df = feature_df.loc[df_aligned_index]
