@@ -693,7 +693,15 @@ def _render_train_results(results: dict) -> None:
         }
         for sym, r in results.items()
     ]
-    _show_table(pd.DataFrame(rows), style_map={"Status": _color_status})
+    df = pd.DataFrame(rows)
+    _show_table(df, style_map={"Status": _color_status})
+    st.download_button(
+        label="⬇ Download CSV",
+        data=df.to_csv(index=False),
+        file_name="train_results.csv",
+        mime="text/csv",
+        key="tr_download",
+    )
 
 
 def page_train() -> None:
