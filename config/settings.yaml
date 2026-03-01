@@ -107,8 +107,11 @@ models:
     target_update_freq: 100    # gradient steps between target-network syncs
     discount_factor: 0.99      # future-reward discount γ (higher than tabular QL)
     epsilon_start: 1.0         # initial exploration rate
-    epsilon_end: 0.01          # minimum exploration rate
-    epsilon_decay: 0.995       # per-episode ε decay factor
+    epsilon_end: 0.01          # final exploration rate
+                               # ε decays LINEARLY per env step from start→end over
+                               # the entire training run (N × n_episodes steps), so
+                               # the agent fully transitions from exploration to
+                               # exploitation regardless of dataset size.
     n_episodes: 10             # passes over training time-series
     transaction_cost: 0.001    # 0.1% per trade (open or close)
     temperature: 0.5           # softmax temperature: lower = more peaked predictions

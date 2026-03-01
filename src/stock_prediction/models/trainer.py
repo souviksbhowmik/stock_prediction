@@ -247,7 +247,7 @@ class ModelTrainer:
         y_reg_val: np.ndarray | None = None
         split_idx_reg = 0
 
-        if (use_encoder_decoder or use_tft or use_qlearning) and seq_reg is not None and reg_targets is not None:
+        if (use_encoder_decoder or use_tft or use_qlearning or use_dqn) and seq_reg is not None and reg_targets is not None:
             split_idx_reg = int(n_reg * self.train_split)
             X_seq_reg_train_s = seq_scaler.transform(
                 seq_reg[:split_idx_reg].reshape(-1, n_features)

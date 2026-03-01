@@ -154,8 +154,11 @@ class DQNPredictor:
         Number of gradient steps between target-network syncs.
     discount_factor:
         Future reward discount γ.
-    epsilon_start / epsilon_end / epsilon_decay:
-        ε-greedy schedule.  ε_episode = max(ε_end, ε_start × ε_decay^episode).
+    epsilon_start / epsilon_end:
+        ε-greedy linear schedule.  ε decays linearly from ε_start to ε_end
+        over the total number of environment steps (N × n_episodes), ensuring
+        the agent transitions from full exploration to near-greedy exploitation
+        by the end of training regardless of dataset size or episode count.
     n_episodes:
         How many passes over the training time-series.
     transaction_cost:
@@ -178,7 +181,6 @@ class DQNPredictor:
         discount_factor: float | None = None,
         epsilon_start: float | None = None,
         epsilon_end: float | None = None,
-        epsilon_decay: float | None = None,
         n_episodes: int | None = None,
         transaction_cost: float | None = None,
         temperature: float | None = None,
@@ -198,7 +200,6 @@ class DQNPredictor:
         self.gamma             = discount_factor    if discount_factor    is not None else float(_cfg("discount_factor", 0.99))
         self.epsilon_start     = epsilon_start      if epsilon_start      is not None else float(_cfg("epsilon_start", 1.0))
         self.epsilon_end       = epsilon_end        if epsilon_end        is not None else float(_cfg("epsilon_end", 0.01))
-        self.epsilon_decay     = epsilon_decay      if epsilon_decay      is not None else float(_cfg("epsilon_decay", 0.995))
         self.n_episodes        = n_episodes         if n_episodes         is not None else int(_cfg("n_episodes", 10))
         self.transaction_cost  = transaction_cost   if transaction_cost   is not None else float(_cfg("transaction_cost", 0.001))
         self.temperature       = temperature        if temperature        is not None else float(_cfg("temperature", 0.5))
@@ -265,20 +266,29 @@ class DQNPredictor:
         N = len(X_tab)
         history: dict = {"episode_rewards": [], "episode_balanced_acc": []}
         total_steps = 0
+        # Total steps over the full training run — used for linear ε schedule.
+        # Linear decay ensures the agent transitions from full exploration at
+        # step 0 to epsilon_end by the last step, regardless of N or n_episodes.
+        total_train_steps = max((N - 1) * self.n_episodes, 1)
 
         self._online_net.train()
 
         for episode in range(self.n_episodes):
-            epsilon = max(
-                self.epsilon_end,
-                self.epsilon_start * (self.epsilon_decay ** episode),
-            )
             position = 0
             total_reward = 0.0
             pred_labels: list[int] = []
 
             for t in range(N - 1):
                 state = X_tab[t].astype(np.float32)
+
+                # ε linear decay per step: goes from epsilon_start → epsilon_end
+                # over the entire training run (much faster convergence than
+                # per-episode exponential decay for neural Q-functions).
+                epsilon = max(
+                    self.epsilon_end,
+                    self.epsilon_start - (self.epsilon_start - self.epsilon_end)
+                    * total_steps / total_train_steps,
+                )
 
                 # ε-greedy action selection
                 if random.random() < epsilon:
@@ -436,7 +446,6 @@ class DQNPredictor:
                 "discount_factor":    self.gamma,
                 "epsilon_start":      self.epsilon_start,
                 "epsilon_end":        self.epsilon_end,
-                "epsilon_decay":      self.epsilon_decay,
                 "n_episodes":         self.n_episodes,
                 "transaction_cost":   self.transaction_cost,
                 "temperature":        self.temperature,
@@ -460,7 +469,6 @@ class DQNPredictor:
         self.gamma              = data.get("discount_factor",    self.gamma)
         self.epsilon_start      = data.get("epsilon_start",      self.epsilon_start)
         self.epsilon_end        = data.get("epsilon_end",        self.epsilon_end)
-        self.epsilon_decay      = data.get("epsilon_decay",      self.epsilon_decay)
         self.n_episodes         = data.get("n_episodes",         self.n_episodes)
         self.transaction_cost   = data.get("transaction_cost",   self.transaction_cost)
         self.temperature        = data.get("temperature",        self.temperature)
