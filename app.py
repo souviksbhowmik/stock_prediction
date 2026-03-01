@@ -1425,7 +1425,6 @@ def page_portfolio() -> None:
         st.info("No open positions. Open trades on the Trade page.")
         return
 
-    any_comment = any(getattr(t, "comment", "") for t in trades)
     rows = [
         {
             "Trade ID":         t.trade_id,
@@ -1438,7 +1437,7 @@ def page_portfolio() -> None:
             "Invested ₹":       f"{t.amount:,.0f}",
             "Unrealized PnL ₹": f"{t.pnl:+,.2f}" if t.pnl is not None else "—",
             "PnL %":            f"{t.pnl_pct:+.1f}%" if t.pnl_pct is not None else "—",
-            **( {"Comment": getattr(t, "comment", "") or "—"} if any_comment else {} ),
+            "Comment":          getattr(t, "comment", "") or "—",
         }
         for t in trades
     ]
