@@ -75,11 +75,20 @@ models:
     batch_size: 32
     patience: 10
   prophet: {}  # no extra hyperparameters needed; tuning done via changepoint_prior_scale grid
+  tft:
+    hidden_size: 128
+    num_heads: 4           # must divide hidden_size evenly; auto-reduced to 1 if not
+    num_lstm_layers: 2
+    dropout: 0.1
+    learning_rate: 0.001
+    epochs: 50
+    batch_size: 32
+    patience: 10
   ensemble:
     lstm_weight: 0.4
     xgboost_weight: 0.6
   selected_models: ["lstm"]  # list of models to train/use; multiple = ensemble
-                             # available: lstm, xgboost, encoder_decoder, prophet
+                             # available: lstm, xgboost, encoder_decoder, prophet, tft
   save_dir: data/models
   train_split: 0.8
   staleness_warning_days: 30

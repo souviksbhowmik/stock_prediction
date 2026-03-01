@@ -15,6 +15,7 @@ from stock_prediction.models.lstm_model import LSTMPredictor
 from stock_prediction.models.xgboost_model import XGBoostPredictor
 from stock_prediction.models.encoder_decoder_model import EncoderDecoderPredictor
 from stock_prediction.models.prophet_model import ProphetPredictor
+from stock_prediction.models.tft_model import TFTPredictor
 from stock_prediction.models.ensemble import EnsembleModel
 from stock_prediction.utils.logging import get_logger
 from stock_prediction.utils.plot_utils import generate_plots
@@ -23,7 +24,7 @@ logger = get_logger("models.trainer")
 
 # Models that can be selected for training.  Add new model IDs here as they
 # are implemented.
-AVAILABLE_MODELS: list[str] = ["lstm", "xgboost", "encoder_decoder", "prophet"]
+AVAILABLE_MODELS: list[str] = ["lstm", "xgboost", "encoder_decoder", "prophet", "tft"]
 
 # ---------------------------------------------------------------------------
 # Hyperparameter search grids
@@ -53,6 +54,15 @@ _ED_PARAM_GRID: list[dict] = [
     {"hidden_size": 128, "dropout": 0.3, "learning_rate": 0.001},
     {"hidden_size": 128, "dropout": 0.2, "learning_rate": 0.0005},
     {"hidden_size": 256, "dropout": 0.3, "learning_rate": 0.001},
+]
+
+# TFT grid: smaller than ED due to higher model complexity
+_TFT_PARAM_GRID: list[dict] = [
+    {"hidden_size": 64,  "num_heads": 4, "dropout": 0.1, "learning_rate": 0.001},
+    {"hidden_size": 64,  "num_heads": 4, "dropout": 0.2, "learning_rate": 0.001},
+    {"hidden_size": 128, "num_heads": 4, "dropout": 0.1, "learning_rate": 0.001},
+    {"hidden_size": 128, "num_heads": 4, "dropout": 0.1, "learning_rate": 0.0005},
+    {"hidden_size": 128, "num_heads": 8, "dropout": 0.2, "learning_rate": 0.001},
 ]
 
 
@@ -113,7 +123,8 @@ class ModelTrainer:
         use_xgboost       = "xgboost"        in selected_models
         use_encoder_decoder = "encoder_decoder" in selected_models
         use_prophet       = "prophet"        in selected_models
-        use_sequence      = use_lstm or use_encoder_decoder
+        use_tft           = "tft"            in selected_models
+        use_sequence      = use_lstm or use_encoder_decoder or use_tft
         logger.info(f"Selected models for {symbol}: {selected_models}")
 
         horizon = int(get_setting("features", "prediction_horizon", default=1))
@@ -126,7 +137,7 @@ class ModelTrainer:
         labels: np.ndarray | None = None
         feature_names: list[str] = []
 
-        if use_lstm or use_xgboost or use_encoder_decoder:
+        if use_lstm or use_xgboost or use_encoder_decoder or use_tft:
             sequences, tabular, labels, feature_names = (
                 self.pipeline.prepare_training_data(symbol, start_date, end_date)
             )
@@ -146,20 +157,23 @@ class ModelTrainer:
             except Exception:
                 n_samples, seq_len, n_features = 0, 60, 0
 
-        # ── 1b. Regression data (Encoder-Decoder) ────────────────────────
+        # ── 1b. Regression data (Encoder-Decoder + TFT) ──────────────────
         seq_reg: np.ndarray | None = None
         reg_targets: np.ndarray | None = None
         labels_reg: np.ndarray | None = None
         n_reg = 0
-        if use_encoder_decoder:
+        if use_encoder_decoder or use_tft:
             seq_reg, _, reg_targets, labels_reg, _ = (
                 self.pipeline.prepare_regression_data(symbol, start_date, end_date)
             )
             n_reg = len(seq_reg)
             if n_reg == 0:
-                logger.warning(f"No regression data for {symbol}, skipping encoder_decoder")
+                logger.warning(f"No regression data for {symbol}, skipping encoder_decoder and tft")
                 use_encoder_decoder = False
-                selected_models = [m for m in selected_models if m != "encoder_decoder"]
+                use_tft = False
+                selected_models = [
+                    m for m in selected_models if m not in ("encoder_decoder", "tft")
+                ]
 
         # ── 1c. Prophet + plot data ──────────────────────────────────────
         # prepare_prophet_data is always called — it provides (dates, close)
@@ -209,7 +223,7 @@ class ModelTrainer:
         y_reg_val: np.ndarray | None = None
         split_idx_reg = 0
 
-        if use_encoder_decoder and seq_reg is not None and reg_targets is not None:
+        if (use_encoder_decoder or use_tft) and seq_reg is not None and reg_targets is not None:
             split_idx_reg = int(n_reg * self.train_split)
             X_seq_reg_train_s = seq_scaler.transform(
                 seq_reg[:split_idx_reg].reshape(-1, n_features)
@@ -249,6 +263,10 @@ class ModelTrainer:
         best_prophet_cps = 0.1
         best_prophet_sps = 10.0
 
+        best_tft_params: dict = {}
+        best_tft_epochs = 0
+        tft_val_acc = 0.0
+
         if use_xgboost and len(X_tab_train_s) > 0:
             logger.info(f"Tuning XGBoost for {symbol}...")
             best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
@@ -281,12 +299,22 @@ class ModelTrainer:
                 feature_df=prophet_feature_df,
             )
 
+        if use_tft and X_seq_reg_train_s is not None:
+            logger.info(f"Tuning TFT for {symbol}...")
+            best_tft_params, best_tft_epochs, tft_val_acc = self._tune_tft(
+                X_seq_reg_train_s, y_reg_train,
+                X_seq_reg_val_s, y_reg_val,
+                labels_reg[split_idx_reg:] if labels_reg is not None else None,
+                n_features,
+            )
+
         # ── 5. Derive ensemble weights ────────────────────────────────────
         accs: dict[str, float] = {}
         if use_lstm:          accs["lstm"]           = lstm_val_acc
         if use_xgboost:       accs["xgboost"]        = xgb_val_acc
         if use_encoder_decoder: accs["encoder_decoder"] = ed_val_acc
         if use_prophet:       accs["prophet"]        = prophet_val_acc
+        if use_tft:           accs["tft"]            = tft_val_acc
 
         total_acc = sum(accs.values())
         if len(accs) == 1:
@@ -296,17 +324,19 @@ class ModelTrainer:
         else:
             for k in accs: accs[k] = 1.0 / len(accs)
 
-        lstm_weight   = accs.get("lstm", 0.0)
-        xgb_weight    = accs.get("xgboost", 0.0)
-        ed_weight     = accs.get("encoder_decoder", 0.0)
+        lstm_weight    = accs.get("lstm", 0.0)
+        xgb_weight     = accs.get("xgboost", 0.0)
+        ed_weight      = accs.get("encoder_decoder", 0.0)
         prophet_weight = accs.get("prophet", 0.0)
+        tft_weight     = accs.get("tft", 0.0)
 
         logger.info(
             f"Ensemble weights for {symbol}: "
             f"lstm={lstm_weight:.3f}(acc={lstm_val_acc:.4f}), "
             f"xgb={xgb_weight:.3f}(acc={xgb_val_acc:.4f}), "
             f"ed={ed_weight:.3f}(acc={ed_val_acc:.4f}), "
-            f"prophet={prophet_weight:.3f}(acc={prophet_val_acc:.4f})"
+            f"prophet={prophet_weight:.3f}(acc={prophet_val_acc:.4f}), "
+            f"tft={tft_weight:.3f}(acc={tft_val_acc:.4f})"
         )
 
         # Overall val accuracy = weighted sum of individual accs
@@ -315,6 +345,7 @@ class ModelTrainer:
             + xgb_weight * xgb_val_acc
             + ed_weight * ed_val_acc
             + prophet_weight * prophet_val_acc
+            + tft_weight * tft_val_acc
         )
 
         # ── 6. Retrain final models on full data ───────────────────────────
@@ -346,6 +377,7 @@ class ModelTrainer:
         lstm_final: LSTMPredictor | None = None
         ed_final: EncoderDecoderPredictor | None = None
         prophet_final: ProphetPredictor | None = None
+        tft_final: TFTPredictor | None = None
 
         if use_xgboost and len(X_tab_full_s) > 0:
             n_est_full = max(best_n_estimators, int(best_n_estimators / self.train_split))
@@ -373,6 +405,17 @@ class ModelTrainer:
             ed_final.train(X_seq_reg_full_s, reg_targets,
                            teacher_forcing_ratio=0.3)   # reduced TF for final model
 
+        if use_tft and seq_reg is not None and reg_targets is not None:
+            X_seq_reg_full_s = full_seq_scaler.transform(
+                seq_reg.reshape(-1, n_features)
+            ).reshape(n_reg, seq_len, n_features)
+            epochs_tft_full = max(best_tft_epochs, int(best_tft_epochs / self.train_split))
+            tft_final = TFTPredictor(
+                input_size=n_features, **best_tft_params, epochs=epochs_tft_full,
+                horizon=horizon,
+            )
+            tft_final.train(X_seq_reg_full_s, reg_targets)
+
         if use_prophet and dates_all is not None:
             prophet_final = ProphetPredictor(horizon=horizon)
             prophet_final._changepoint_prior_scale = best_prophet_cps
@@ -386,17 +429,19 @@ class ModelTrainer:
             xgboost=xgb_final,
             encoder_decoder=ed_final,
             prophet=prophet_final,
+            tft=tft_final,
             lstm_weight=lstm_weight,
             xgboost_weight=xgb_weight,
             encoder_decoder_weight=ed_weight,
             prophet_weight=prophet_weight,
+            tft_weight=tft_weight,
         )
 
         # ── 7. Save ───────────────────────────────────────────────────────
         self._save_models(
-            symbol, lstm_final, xgb_final, ed_final, prophet_final,
+            symbol, lstm_final, xgb_final, ed_final, prophet_final, tft_final,
             full_scaler, full_seq_scaler, feature_names,
-            lstm_weight, xgb_weight, ed_weight, prophet_weight,
+            lstm_weight, xgb_weight, ed_weight, prophet_weight, tft_weight,
             selected_models, n_features,
             horizon=horizon,
             use_news=self.use_news,
@@ -437,6 +482,11 @@ class ModelTrainer:
                 elif ed_final is not None and ed_ratios_for_plot is not None:
                     # X_seq_reg_full_s was built just above when ed_ratios_for_plot was set
                     predicted_signals_for_plot = ed_final.predict(X_seq_reg_full_s)
+                elif tft_final is not None and seq_reg is not None:
+                    X_seq_reg_full_s_tft = full_seq_scaler.transform(
+                        seq_reg.reshape(-1, n_features)
+                    ).reshape(n_reg, seq_len, n_features)
+                    predicted_signals_for_plot = tft_final.predict(X_seq_reg_full_s_tft)
             except Exception as pe:
                 logger.warning(f"Could not generate predicted signals for plot: {pe}")
 
@@ -556,6 +606,50 @@ class ModelTrainer:
         )
         return best_params, best_epochs, best_val_acc
 
+    def _tune_tft(
+        self,
+        X_seq_train: np.ndarray,    # (N_train, seq_len, n_features) — scaled
+        y_reg_train: np.ndarray,    # (N_train, horizon) — ratio targets
+        X_seq_val: np.ndarray,
+        y_reg_val: np.ndarray,
+        val_labels: np.ndarray | None,  # (N_val,) classification labels for balanced_acc
+        n_features: int,
+    ) -> tuple[dict, int, float]:
+        """Grid-search TFT hyperparameters by MAPE; report balanced accuracy."""
+        horizon = int(get_setting("features", "prediction_horizon", default=1))
+        best_mape = float("inf")
+        best_params: dict = {}
+        best_epochs = int(get_setting("models", "tft", "epochs", default=50))
+        best_val_acc = 0.0
+
+        for params in _TFT_PARAM_GRID:
+            model = TFTPredictor(input_size=n_features, **params, horizon=horizon)
+            history = model.train(X_seq_train, y_reg_train, X_seq_val, y_reg_val)
+            mape = model.compute_mape(X_seq_val, y_reg_val)
+            epoch = int(history.get("best_epoch", model.epochs))
+
+            if val_labels is not None and len(val_labels) > 0:
+                pred_labels = model.predict(X_seq_val)
+                n = min(len(pred_labels), len(val_labels))
+                acc = balanced_accuracy_score(val_labels[:n], pred_labels[:n])
+            else:
+                acc = 0.0
+
+            logger.info(
+                f"  TFT {params} → MAPE={mape:.4f}, balanced_acc={acc:.4f}, epoch={epoch}"
+            )
+            if mape < best_mape:
+                best_mape = mape
+                best_params = dict(params)
+                best_epochs = epoch
+                best_val_acc = acc
+
+        logger.info(
+            f"Best TFT: {best_params}, epochs={best_epochs}, "
+            f"MAPE={best_mape:.4f}, balanced_acc={best_val_acc:.4f}"
+        )
+        return best_params, best_epochs, best_val_acc
+
     def _cfg_xgb_n_estimators(self) -> int:
         return int(get_setting("models", "xgboost", "n_estimators", default=500))
 
@@ -649,15 +743,17 @@ class ModelTrainer:
             else:
                 selected_models = [old_mode]
 
-        lstm_path = model_dir / "lstm.pt"
-        xgb_path  = model_dir / "xgboost.joblib"
-        ed_path   = model_dir / "encoder_decoder.pt"
+        lstm_path  = model_dir / "lstm.pt"
+        xgb_path   = model_dir / "xgboost.joblib"
+        ed_path    = model_dir / "encoder_decoder.pt"
         proph_path = model_dir / "prophet.joblib"
+        tft_path   = model_dir / "tft.pt"
 
         lstm: LSTMPredictor | None = None
         xgb:  XGBoostPredictor | None = None
         ed:   EncoderDecoderPredictor | None = None
         prophet: ProphetPredictor | None = None
+        tft: TFTPredictor | None = None
 
         if "lstm" in selected_models:
             if not lstm_path.exists():
@@ -683,12 +779,19 @@ class ModelTrainer:
             prophet = ProphetPredictor()
             prophet.load(proph_path)
 
+        if "tft" in selected_models:
+            if not tft_path.exists():
+                raise FileNotFoundError(f"TFT model not found for {symbol}")
+            tft = TFTPredictor(input_size=meta["input_size"])
+            tft.load(tft_path)
+
         ensemble = EnsembleModel(
-            lstm=lstm, xgboost=xgb, encoder_decoder=ed, prophet=prophet,
+            lstm=lstm, xgboost=xgb, encoder_decoder=ed, prophet=prophet, tft=tft,
             lstm_weight=meta.get("lstm_weight"),
             xgboost_weight=meta.get("xgb_weight"),
             encoder_decoder_weight=meta.get("ed_weight", 0.0),
             prophet_weight=meta.get("prophet_weight", 0.0),
+            tft_weight=meta.get("tft_weight", 0.0),
         )
 
         model_age_days = None
@@ -706,6 +809,7 @@ class ModelTrainer:
         xgb: XGBoostPredictor | None,
         ed: EncoderDecoderPredictor | None,
         prophet: ProphetPredictor | None,
+        tft: TFTPredictor | None,
         scaler: StandardScaler,
         seq_scaler: StandardScaler,
         feature_names: list[str],
@@ -713,6 +817,7 @@ class ModelTrainer:
         xgb_weight: float,
         ed_weight: float,
         prophet_weight: float,
+        tft_weight: float,
         selected_models: list[str],
         input_size: int,
         horizon: int = 5,
@@ -728,6 +833,7 @@ class ModelTrainer:
         if xgb     is not None: xgb.save(model_dir / "xgboost.joblib")
         if ed      is not None: ed.save(model_dir / "encoder_decoder.pt")
         if prophet is not None: prophet.save(model_dir / "prophet.joblib")
+        if tft     is not None: tft.save(model_dir / "tft.pt")
 
         joblib.dump(
             {
@@ -739,6 +845,7 @@ class ModelTrainer:
                 "xgb_weight":      xgb_weight,
                 "ed_weight":       ed_weight,
                 "prophet_weight":  prophet_weight,
+                "tft_weight":      tft_weight,
                 "selected_models": selected_models,
                 "trained_at":      datetime.now().isoformat(),
                 "horizon":         horizon,

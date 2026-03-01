@@ -1,4 +1,4 @@
-"""Weighted ensemble of LSTM, XGBoost, Encoder-Decoder, and Prophet models."""
+"""Weighted ensemble of LSTM, XGBoost, Encoder-Decoder, Prophet, and TFT models."""
 
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ def _get_prophet_type():
     from stock_prediction.models.prophet_model import ProphetPredictor
     return ProphetPredictor
 
+def _get_tft_type():
+    from stock_prediction.models.tft_model import TFTPredictor
+    return TFTPredictor
+
 
 @dataclass
 class EnsemblePrediction:
@@ -41,16 +45,20 @@ class EnsemblePrediction:
     prophet_probs: dict[str, float] = field(
         default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
     )
+    tft_probs: dict[str, float] = field(
+        default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
+    )
 
 
 class EnsembleModel:
-    """Weighted-average ensemble of up to four model types.
+    """Weighted-average ensemble of up to five model types.
 
     Supported models (any combination):
       - lstm           : LSTM sequence classifier
       - xgboost        : XGBoost tabular classifier
       - encoder_decoder: Encoder-Decoder LSTM regressor (ratios → probs via Gaussian CDF)
       - prophet        : Prophet time-series regressor (single forecast broadcast)
+      - tft            : Temporal Fusion Transformer regressor (ratios → probs via Gaussian CDF)
 
     At least one model must be provided.  The weights must sum to 1.0; the
     caller (ModelTrainer) derives them dynamically from validation balanced
@@ -63,18 +71,24 @@ class EnsembleModel:
         xgboost=None,
         encoder_decoder=None,
         prophet=None,
+        tft=None,
         lstm_weight: float | None = None,
         xgboost_weight: float | None = None,
         encoder_decoder_weight: float | None = None,
         prophet_weight: float | None = None,
+        tft_weight: float | None = None,
     ):
-        if lstm is None and xgboost is None and encoder_decoder is None and prophet is None:
-            raise ValueError("At least one of lstm / xgboost / encoder_decoder / prophet must be provided")
+        if (lstm is None and xgboost is None and encoder_decoder is None
+                and prophet is None and tft is None):
+            raise ValueError(
+                "At least one of lstm / xgboost / encoder_decoder / prophet / tft must be provided"
+            )
 
         self.lstm = lstm
         self.xgboost = xgboost
         self.encoder_decoder = encoder_decoder
         self.prophet = prophet
+        self.tft = tft
 
         self.lstm_weight = lstm_weight if lstm_weight is not None else (
             get_setting("models", "ensemble", "lstm_weight", default=0.4)
@@ -84,6 +98,7 @@ class EnsembleModel:
         )
         self.encoder_decoder_weight = encoder_decoder_weight if encoder_decoder_weight is not None else 0.0
         self.prophet_weight = prophet_weight if prophet_weight is not None else 0.0
+        self.tft_weight = tft_weight if tft_weight is not None else 0.0
 
     def predict(
         self, X_seq: np.ndarray | None, X_tab: np.ndarray | None
@@ -91,8 +106,8 @@ class EnsembleModel:
         """Generate predictions for N samples.
 
         Args:
-            X_seq: (N, seq_len, n_features) — used by lstm and encoder_decoder.
-                   May be None if neither model is active.
+            X_seq: (N, seq_len, n_features) — used by lstm, encoder_decoder, and tft.
+                   May be None if none of those models are active.
             X_tab: (N, n_features) — used by xgboost.
                    May be None if xgboost is not active.
         """
@@ -110,10 +125,11 @@ class EnsembleModel:
         weighted_sum = np.zeros((N, 3), dtype=np.float32)
         total_weight = 0.0
 
-        lstm_probs = zeros.copy()
-        xgb_probs = zeros.copy()
-        ed_probs = zeros.copy()
+        lstm_probs    = zeros.copy()
+        xgb_probs     = zeros.copy()
+        ed_probs      = zeros.copy()
         prophet_probs = zeros.copy()
+        tft_probs     = zeros.copy()
 
         if self.lstm is not None and X_seq is not None:
             lstm_probs = self.lstm.predict_proba(X_seq)
@@ -134,6 +150,11 @@ class EnsembleModel:
             prophet_probs = self.prophet.predict_proba(N)
             weighted_sum += self.prophet_weight * prophet_probs
             total_weight += self.prophet_weight
+
+        if self.tft is not None and X_seq is not None:
+            tft_probs = self.tft.predict_proba(X_seq)
+            weighted_sum += self.tft_weight * tft_probs
+            total_weight += self.tft_weight
 
         ensemble_probs = weighted_sum / max(total_weight, 1e-8)
 
@@ -170,6 +191,11 @@ class EnsembleModel:
                         "SELL": float(prophet_probs[i][0]),
                         "HOLD": float(prophet_probs[i][1]),
                         "BUY":  float(prophet_probs[i][2]),
+                    },
+                    tft_probs={
+                        "SELL": float(tft_probs[i][0]),
+                        "HOLD": float(tft_probs[i][1]),
+                        "BUY":  float(tft_probs[i][2]),
                     },
                 )
             )
