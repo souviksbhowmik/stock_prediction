@@ -22,10 +22,15 @@ src/stock_prediction/
 │   ├── news_based.py       # News/LLM feature merging
 │   └── pipeline.py         # Orchestrates feature construction + labeling
 ├── models/                 # ML models
-│   ├── lstm_model.py       # StockLSTM (PyTorch)
-│   ├── xgboost_model.py    # XGBoostPredictor
-│   ├── ensemble.py         # Weighted ensemble
-│   └── trainer.py          # Training orchestration + model persistence
+│   ├── lstm_model.py           # StockLSTM (PyTorch classifier)
+│   ├── xgboost_model.py        # XGBoostPredictor (tabular classifier)
+│   ├── encoder_decoder_model.py # Seq2seq LSTM regressor → signal
+│   ├── prophet_model.py        # Facebook Prophet regressor → signal
+│   ├── tft_model.py            # Temporal Fusion Transformer regressor → signal
+│   ├── qlearning_model.py      # Tabular Q-learning RL agent
+│   ├── dqn_model.py            # Deep Q-Network RL agent
+│   ├── ensemble.py             # Weighted ensemble of all model types
+│   └── trainer.py              # Training orchestration + model persistence
 ├── signals/                # Signal generation + screening
 │   ├── generator.py        # TradingSignal, confidence thresholds
 │   ├── screener.py         # StockScreener (suggest, shortlist, screen)
@@ -341,21 +346,91 @@ Dense(64 → 3)  →  Softmax  →  [P(SELL), P(HOLD), P(BUY)]
 - Feature importance via `get_feature_importance()`
 - Saves as `.joblib` with model + feature_names
 
+### Encoder-Decoder Architecture
+
+**File:** `src/stock_prediction/models/encoder_decoder_model.py`
+
+Sequence-to-sequence LSTM that predicts a vector of `horizon` future price ratios (regression targets: `close[t+k] / close[t]`). Probability conversion via a Gaussian CDF model fitted to validation residuals.
+
+| Component | Detail |
+|---|---|
+| Encoder | LSTM `(seq_len, n_features) → hidden` |
+| Decoder | LSTM with optional teacher forcing; outputs `(horizon,)` ratios |
+| Loss | MSE on price ratios |
+| Tuning metric | MAPE (lower = better) |
+| Probability | Gaussian CDF over per-step thresholds; softmax-normalised to (SELL, HOLD, BUY) |
+
+### Temporal Fusion Transformer (TFT)
+
+**File:** `src/stock_prediction/models/tft_model.py`
+
+Pure-PyTorch implementation using the same regression→signal pipeline as the Encoder-Decoder. Same input/output interface; same MAPE-based tuning.
+
+| Component | Detail |
+|---|---|
+| `GatedResidualNetwork` | `Linear → ELU → Linear → GLU gating → LayerNorm + skip` |
+| `VariableSelectionNetwork` | Per-feature GRN + softmax attention weights |
+| `TemporalFusionTransformer` | VSN → LSTM encoder → Multi-head Self-Attention → GRN → Linear `(B, horizon)` |
+| Loss | MSE on price ratios |
+| `num_heads` | Auto-reduced to 1 if `hidden_size % num_heads != 0` |
+
+### Tabular Q-Learning
+
+**File:** `src/stock_prediction/models/qlearning_model.py`
+
+Reinforcement learning agent. Actions: 0=SELL, 1=HOLD, 2=BUY. State space is discretised from a configurable subset of the feature vector using quantile bins fitted on training data.
+
+**Reward function** (Moody & Saffell 2001):
+```
+reward(t) = new_position(t) × r(t) − |Δposition| × tc
+```
+where `r(t)` is the 1-step return and `tc` is transaction cost (0.1%).
+
+| Component | Detail |
+|---|---|
+| State | Tuple of quantile-bin indices over state features |
+| Q-table | `dict[state_tuple, np.ndarray(3)]` — lazily initialised with HOLD-biased prior |
+| Update | `Q(s,a) ← Q(s,a) + α[r + γ max_a' Q(s',a') − Q(s,a)]` |
+| Exploration | ε-greedy; ε decays per episode |
+| Output | Softmax over Q-values with configurable temperature |
+| Input | Last timestep of the sequence window `X_seq[:, -1, :]` |
+
+### Deep Q-Network (DQN)
+
+**File:** `src/stock_prediction/models/dqn_model.py`
+
+Neural Q-learning agent. Same reward function as tabular Q-learning. Three improvements over the tabular model:
+- **Neural Q-function** — continuous state; MLP generalises to unseen feature combinations without discretisation.
+- **Experience replay buffer** — circular deque; random mini-batch sampling breaks temporal correlations.
+- **Target network** — periodically frozen copy supplies stable Bellman targets, reducing the moving-target problem.
+
+| Component | Detail |
+|---|---|
+| `_QNetwork` | `Input(n_features) → [Linear→ReLU→Dropout]×N → Linear(3)` |
+| `_ReplayBuffer` | Fixed-capacity `deque`; `.push()` / `.sample(batch_size)` |
+| Loss | Huber (smooth-L1) for robustness to reward outliers |
+| Gradient clipping | `max_norm=10.0` |
+| Input | Last timestep `X_seq[:, -1, :]` (same as Q-learning) |
+| Output | Softmax over Q-values with configurable temperature |
+
 ### Ensemble Weighting
 
 **File:** `src/stock_prediction/models/ensemble.py`
 
-**Class: EnsembleModel**
+**Class: EnsembleModel** — supports up to seven model types simultaneously.
 
 ```
-ensemble_probs = 0.4 * LSTM_probs + 0.6 * XGBoost_probs
+ensemble_probs = Σ (weight_i × model_i.predict_proba()) / Σ weight_i
 signal = argmax(ensemble_probs)   # 0=SELL, 1=HOLD, 2=BUY
 confidence = max(ensemble_probs)
 ```
 
-**EnsemblePrediction dataclass:**
-- `signal` (str), `signal_idx` (int), `confidence` (float)
-- `probabilities` (dict), `lstm_probs`, `xgboost_probs`
+Weights are derived dynamically from each model's validation balanced accuracy (normalised so they sum to 1.0). A model's weight is proportional to how well it performed on the held-out validation set — better models automatically dominate the ensemble.
+
+**EnsemblePrediction dataclass fields:**
+- `signal`, `signal_idx`, `confidence`, `probabilities`
+- `lstm_probs`, `xgboost_probs`, `encoder_decoder_probs`, `prophet_probs`
+- `tft_probs`, `qlearning_probs`, `dqn_probs`
 
 ### Model Trainer
 
@@ -687,16 +762,30 @@ stockpredict train --symbols RELIANCE.NS
   │
   ├─ StandardScaler.fit_transform(train), transform(val)
   │
-  ├─ LSTMPredictor.train(X_seq_train, y_train, X_seq_val, y_val)
-  │    └─ Adam + CrossEntropyLoss + early stopping (patience=10)
+  ├─ [Classification models — LSTM, XGBoost]
+  │    ├─ LSTMPredictor.train(X_seq_train, y_train)     → CrossEntropyLoss + early stopping
+  │    └─ XGBoostPredictor.train(X_tab_train, y_train)  → multi:softprob + early stopping
   │
-  ├─ XGBoostPredictor.train(X_tab_train, y_train, X_tab_val, y_val)
-  │    └─ multi:softprob + early stopping (20 rounds)
+  ├─ [Regression models — Encoder-Decoder, TFT]
+  │    ├─ prepare_regression_data() → (sequences, reg_targets, labels)
+  │    ├─ EncoderDecoderPredictor.train(X_seq, reg_targets)  → MSE loss; tuned by MAPE
+  │    └─ TFTPredictor.train(X_seq, reg_targets)             → MSE loss; tuned by MAPE
+  │
+  ├─ [RL agents — Q-learning, DQN]
+  │    ├─ QLearningPredictor.train(X_last_step, returns_1d)  → ε-greedy Q-table update
+  │    └─ DQNPredictor.train(X_last_step, returns_1d)        → Huber loss + replay buffer
+  │
+  ├─ [Prophet]
+  │    └─ ProphetPredictor.tune() + fit_full()               → changepoint grid search
+  │
+  ├─ Ensemble weights: each model's val balanced_accuracy / total
+  │
+  ├─ Retrain all selected models on full dataset (100%)
   │
   ├─ Save to data/models/RELIANCE_NS/
-  │    ├─ lstm.pt
-  │    ├─ xgboost.joblib
-  │    └─ meta.joblib (scalers, feature_names, trained_at)
+  │    ├─ lstm.pt / xgboost.joblib / encoder_decoder.pt
+  │    ├─ prophet.joblib / tft.pt / qlearning.joblib / dqn.pt
+  │    └─ meta.joblib (scalers, feature_names, weights, trained_at, horizon)
   │
   └─ Write data/reports/train_summary.csv
        └─ Symbol | Status | Val Accuracy | Reason  (one row per symbol)
@@ -716,9 +805,11 @@ stockpredict predict --symbols RELIANCE.NS
   ├─ Scale features with saved StandardScaler
   │
   ├─ EnsembleModel.predict(X_seq, X_tab)
-  │    ├─ LSTM: predict_proba(X_seq) → (N, 3)
+  │    ├─ LSTM / Encoder-Decoder / TFT: predict_proba(X_seq) → (N, 3)
   │    ├─ XGBoost: predict_proba(X_tab) → (N, 3)
-  │    └─ Weighted: 0.4 * LSTM + 0.6 * XGBoost → signal + confidence
+  │    ├─ Q-learning / DQN: predict_proba(X_seq[:, -1, :]) → (N, 3)
+  │    ├─ Prophet: broadcast single horizon-ahead probability → (N, 3)
+  │    └─ Weighted average using per-model val balanced accuracy weights
   │
   ├─ SignalGenerator.generate()
   │    ├─ Apply confidence thresholds (0.6 / 0.8)
@@ -761,9 +852,14 @@ stock_prediction/
 │   ├── raw/                       # OHLCV cache from yfinance
 │   ├── models/                    # Trained ML models
 │   │   └── {SYMBOL}/             # e.g., RELIANCE_NS/
-│   │       ├── lstm.pt            # PyTorch state_dict + architecture metadata
+│   │       ├── lstm.pt            # PyTorch LSTM state_dict + metadata
 │   │       ├── xgboost.joblib     # XGBClassifier + feature_names
-│   │       └── meta.joblib        # StandardScalers + feature_names + trained_at
+│   │       ├── encoder_decoder.pt # PyTorch Encoder-Decoder state_dict
+│   │       ├── prophet.joblib     # Fitted Prophet model + regressors
+│   │       ├── tft.pt             # PyTorch TFT state_dict + metadata
+│   │       ├── qlearning.joblib   # Q-table + bin edges + state feature indices
+│   │       ├── dqn.pt             # PyTorch DQN Q-network state_dict + metadata
+│   │       └── meta.joblib        # Scalers, feature_names, weights, trained_at
 │   ├── news_cache/                # RSS + LLM response cache
 │   │   ├── {md5_query}.json       # RSS articles (6-hour expiry)
 │   │   └── {md5_symbol_date}.json # LLM scores (24-hour expiry)
@@ -792,9 +888,9 @@ stock_prediction/
 
 | Artifact | Format | Serialization |
 |----------|--------|---------------|
-| LSTM model | `.pt` | `torch.save(state_dict + metadata)` |
-| XGBoost model | `.joblib` | `joblib.dump(model + feature_names)` |
-| Model metadata | `.joblib` | `joblib.dump(scalers + feature_names + trained_at)` |
+| LSTM / Encoder-Decoder / TFT / DQN | `.pt` | `torch.save(state_dict + metadata)` |
+| XGBoost / Prophet / Q-learning | `.joblib` | `joblib.dump(model + metadata)` |
+| Model metadata | `.joblib` | `joblib.dump(scalers + feature_names + weights + trained_at)` |
 | News cache | `.json` | JSON array of NewsArticle dicts |
 | LLM cache | `.json` | JSON dict of scores + `_summary` |
 | Trade ledger | `.json` | JSON array of PaperTrade dicts |

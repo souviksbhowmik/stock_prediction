@@ -305,6 +305,59 @@ prophet: {}
 
 Prophet has no architecture hyperparameters set here. Instead, `changepoint_prior_scale` and `seasonality_prior_scale` are grid-searched during tuning. The best values are found automatically and saved with the model.
 
+### `models.tft`
+
+Temporal Fusion Transformer — gated residual network variable selection, LSTM encoder, and multi-head self-attention. Uses a regression approach (predicts `horizon` price ratios) identical to the Encoder-Decoder model.
+
+| Key | Default | Description |
+|---|---|---|
+| `hidden_size` | `128` | Width of all internal layers (GRN, LSTM, attention projections). Tuner searches `[64, 128]`. |
+| `num_heads` | `4` | Number of self-attention heads. Must divide `hidden_size` evenly; auto-reduced to 1 if not. Tuner tries `[4, 8]`. |
+| `num_lstm_layers` | `2` | Stacked LSTM layers in the temporal encoder. |
+| `dropout` | `0.1` | Dropout rate. Tuner searches `[0.1, 0.2]`. |
+| `learning_rate` | `0.001` | Adam learning rate. Tuner uses `[0.001, 0.0005]`. |
+| `epochs` | `50` | Maximum training epochs; early stopping applies. |
+| `batch_size` | `32` | Mini-batch size. |
+| `patience` | `10` | Early stopping patience. |
+
+### `models.qlearning`
+
+Tabular Q-learning agent. Actions are SELL (0), HOLD (1), BUY (2). State space is a discretised subset of the feature vector; Q-values are stored in an explicit Q-table. Uses a position-based P&L reward: `new_position × r(t) − |Δposition| × tc`.
+
+| Key | Default | Description |
+|---|---|---|
+| `state_features` | `["RSI", "MACD_Histogram", "BB_Width", "Volume_Ratio", "Price_Momentum_5d"]` | Feature columns used to build the discrete state. Missing names are silently skipped. |
+| `n_bins` | `3` | Quantile buckets per state feature. `3` bins × 5 features = 243 states. Tuner searches `[3, 4, 5]`. |
+| `learning_rate` | `0.1` | Q-learning step size α. |
+| `discount_factor` | `0.95` | Future reward discount γ. |
+| `epsilon_start` | `1.0` | Initial exploration rate (fully random at episode 0). |
+| `epsilon_end` | `0.01` | Minimum exploration rate. |
+| `epsilon_decay` | `0.995` | Per-episode ε multiplier. |
+| `n_episodes` | `10` | Passes over the chronological training time-series. |
+| `transaction_cost` | `0.001` | Fraction of trade value charged per open/close (0.1%). |
+| `temperature` | `0.5` | Softmax temperature for converting Q-values to probabilities. Lower = more peaked. |
+
+### `models.dqn`
+
+Deep Q-Network agent. Same reward function as Q-learning, but uses a neural MLP Q-function trained on mini-batches from an experience replay buffer, with a periodically-frozen target network for training stability.
+
+| Key | Default | Description |
+|---|---|---|
+| `hidden_sizes` | `[256, 128]` | MLP hidden layer widths. Add more entries for deeper networks (e.g. `[256, 128, 64]`). Tuner searches several configurations. |
+| `dropout` | `0.2` | Dropout rate applied after each hidden layer. Tuner searches `[0.2, 0.3]`. |
+| `learning_rate` | `0.001` | Adam learning rate. Tuner uses `[0.001, 0.0005]`. |
+| `batch_size` | `64` | Mini-batch size sampled from the replay buffer per gradient step. |
+| `buffer_size` | `10000` | Maximum transitions stored in the replay buffer. Older transitions are evicted (FIFO). |
+| `min_buffer_size` | `64` | Minimum buffer occupancy before gradient updates begin. |
+| `target_update_freq` | `100` | Gradient steps between target-network syncs. |
+| `discount_factor` | `0.99` | Future reward discount γ (higher than tabular QL for DQN stability). |
+| `epsilon_start` | `1.0` | Initial exploration rate. |
+| `epsilon_end` | `0.01` | Minimum exploration rate. |
+| `epsilon_decay` | `0.995` | Per-episode ε multiplier. |
+| `n_episodes` | `10` | Passes over the chronological training time-series. |
+| `transaction_cost` | `0.001` | Fraction charged per open/close (0.1%). |
+| `temperature` | `0.5` | Softmax temperature for Q-value → probability conversion. |
+
 ### `models.ensemble`
 
 When multiple models are selected, their probability outputs are combined via a **dynamic weighted average** derived from each model's individual validation balanced accuracy — better models automatically receive higher weight. The weights below are only used as a static fallback if dynamic weights cannot be computed.
@@ -331,8 +384,13 @@ When multiple models are selected, their probability outputs are combined via a 
 | `["xgboost"]` | XGBoost tabular classifier. Fast training, interpretable feature importances, no sequence context. |
 | `["encoder_decoder"]` | Encoder-Decoder LSTM regressor. Predicts multi-step price ratios; converts to BUY/HOLD/SELL. |
 | `["prophet"]` | Facebook Prophet time-series model. Captures seasonality and trend; outputs a probabilistic signal. |
-| `["lstm", "xgboost"]` | Two-model ensemble, dynamically weighted by validation accuracy. |
-| `["lstm", "xgboost", "encoder_decoder", "prophet"]` | Full ensemble — all four models combined. |
+| `["tft"]` | Temporal Fusion Transformer. Gated residual networks + multi-head self-attention; regression approach. |
+| `["qlearning"]` | Tabular Q-learning RL agent. Discretised state space; position-based P&L reward. |
+| `["dqn"]` | Deep Q-Network RL agent. Continuous-state MLP Q-function with replay buffer and target network. |
+| `["lstm", "xgboost"]` | Two-model ensemble, dynamically weighted by validation balanced accuracy. |
+| `["lstm", "xgboost", "encoder_decoder", "prophet"]` | Classic four-model ensemble. |
+| `["qlearning", "dqn"]` | RL-only ensemble. |
+| `["lstm", "xgboost", "tft", "qlearning", "dqn"]` | Five-model ensemble — classifiers + regressor + both RL agents. |
 
 > Each saved model records the models it was trained with and the features used. Prediction always matches training conditions regardless of the current config value.
 
@@ -344,7 +402,7 @@ When multiple models are selected, their probability outputs are combined via a 
 | `seq_scaler` | Fitted `StandardScaler` for sequence features |
 | `feature_names` | Ordered list of feature column names used during training |
 | `input_size` | Feature dimension |
-| `lstm_weight` / `xgb_weight` / `ed_weight` / `prophet_weight` | Dynamic ensemble weights derived from validation accuracy |
+| `lstm_weight` / `xgb_weight` / `ed_weight` / `prophet_weight` / `tft_weight` / `ql_weight` / `dqn_weight` | Dynamic ensemble weights derived from validation balanced accuracy |
 | `selected_models` | List of model IDs that were trained |
 | `trained_at` | ISO-format timestamp of when training completed |
 | `horizon` | Prediction horizon (days) used during training |

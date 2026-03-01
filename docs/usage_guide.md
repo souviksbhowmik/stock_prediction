@@ -115,12 +115,16 @@ Trains one or more ML models per symbol. When multiple models are selected they 
 |---|---|---|
 | `lstm` (default) | Classifier | Captures temporal patterns across 60-timestep rolling windows |
 | `xgboost` | Classifier | Fast, interpretable; uses tabular feature snapshots |
-| `encoder_decoder` | Regressor→signal | Predicts price ratios for each horizon step; converts to BUY/HOLD/SELL via thresholds |
+| `encoder_decoder` | Regressor→signal | Seq2seq LSTM; predicts price ratios for each horizon step; Gaussian CDF → BUY/HOLD/SELL |
 | `prophet` | Regressor→signal | Facebook Prophet time-series model with lag-safe exogenous regressors |
-| `lstm,xgboost` | Ensemble | Both classifiers; combined via dynamic weights from validation balanced accuracy |
-| `lstm,xgboost,encoder_decoder,prophet` | Ensemble | All four models; weights proportional to each model's validation balanced accuracy |
+| `tft` | Regressor→signal | Temporal Fusion Transformer; gated residual networks + multi-head self-attention over sequences |
+| `qlearning` | RL agent | Tabular Q-learning with discretised state space; reward = position-based P&L minus transaction cost |
+| `dqn` | RL agent | Deep Q-Network; continuous-state MLP Q-function with experience replay and target network |
+| `lstm,xgboost` | Ensemble | Two classifiers; combined via dynamic weights from validation balanced accuracy |
+| `lstm,xgboost,encoder_decoder,prophet` | Ensemble | Four models combined; weights proportional to each model's validation balanced accuracy |
+| `qlearning,dqn` | Ensemble | Both RL agents in an ensemble |
 
-> Any combination of the four model names works. For single-model selections, the weight is 1.0. For ensembles, each model's contribution is proportional to its validation balanced accuracy.
+> Any combination of the seven model names works. For single-model selections the weight is 1.0. For ensembles, each model's contribution is proportional to its validation balanced accuracy — better models automatically receive higher weight.
 
 **Prediction horizon** (`--horizon` / `-h`):
 
@@ -144,6 +148,9 @@ Thresholds are configurable in `config/settings.yaml` under `signals.horizon_thr
   - `xgboost.joblib` — trained XGBoost classifier with feature names
   - `encoder_decoder.pt` — PyTorch Encoder-Decoder weights
   - `prophet.joblib` — fitted Prophet model with regressors
+  - `tft.pt` — PyTorch Temporal Fusion Transformer weights
+  - `qlearning.joblib` — Q-table, bin edges, and state feature indices
+  - `dqn.pt` — PyTorch DQN Q-network weights
   - `meta.joblib` — scalers, feature names, selected models, `trained_at` timestamp, `horizon`, `use_news`, `use_llm`, `use_financials`, `val_accuracy`, and per-model ensemble weights
 - Interactive HTML plots per symbol to `data/plots/{SYMBOL}/`:
   - `train_plot.html` — training period actual vs predicted signals
@@ -157,8 +164,13 @@ stockpredict train -m lstm                               # LSTM only (default)
 stockpredict train -m xgboost                            # XGBoost only
 stockpredict train -m encoder_decoder                    # Encoder-Decoder only
 stockpredict train -m prophet                            # Prophet only
+stockpredict train -m tft                                # Temporal Fusion Transformer only
+stockpredict train -m qlearning                          # Tabular Q-learning only
+stockpredict train -m dqn                                # Deep Q-Network only
 stockpredict train -m lstm,xgboost                       # Ensemble of LSTM + XGBoost
-stockpredict train -m lstm,xgboost,encoder_decoder,prophet  # All four models
+stockpredict train -m lstm,xgboost,encoder_decoder,prophet  # Classic four-model ensemble
+stockpredict train -m qlearning,dqn                      # RL-only ensemble
+stockpredict train -m lstm,xgboost,tft,qlearning,dqn    # Five-model ensemble
 stockpredict train -s RELIANCE.NS -h 1                   # 1-day horizon
 stockpredict train -s RELIANCE.NS -h 10                  # 10-day horizon
 stockpredict train -s RELIANCE.NS --no-news --no-llm     # Technical + financials only (faster)
