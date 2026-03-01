@@ -92,30 +92,47 @@ stockpredict fetch-data -s RELIANCE.NS --start-date 2023-01-01
 ### `train` — Train Prediction Models
 
 **What it does:**
-Trains one or more ML models (LSTM and/or XGBoost) per symbol. When multiple models are selected they are combined into a weighted ensemble at prediction time. For each symbol the pipeline:
+Trains one or more ML models per symbol. When multiple models are selected they are combined into a weighted ensemble at prediction time. For each symbol the pipeline:
 
 1. Fetches OHLCV data live from yfinance (from `--start-date` or `2020-01-01` by default)
 2. Computes 30+ technical indicators (RSI, MACD, Bollinger Bands, ATR, OBV, VWAP, Stochastic, SMA/EMA crossovers, lag/momentum features)
 3. Adds NIFTY 50 market context (daily return, relative strength 1d/5d)
-4. Optionally fetches Google News RSS articles, runs FinBERT sentiment analysis and spaCy NER to produce 18 news features
-5. Optionally calls the local Ollama LLM to generate 10 broker-style insight scores per stock
-6. Creates training labels using the configured prediction horizon (default 5 trading days): ≥2.2% → BUY, ≤-2.2% → SELL, else HOLD
-7. Builds 60-day rolling windows for the LSTM and tabular snapshots for XGBoost
-8. Splits chronologically (80% train / 20% validation — no shuffling to prevent data leakage)
-9. Grid-searches hyperparameters for selected model(s) on the validation split (6 combinations each)
+4. Optionally fetches Google News RSS articles, runs FinBERT sentiment analysis and spaCy NER to produce 18 news features (`--no-news` to skip)
+5. Optionally calls the local Ollama LLM to generate 10 broker-style insight scores per stock (`--no-llm` to skip)
+6. Optionally fetches quarterly financial report data (revenue growth, margins, EPS surprise, leverage, etc.) and adds 16 point-in-time financial features (`--no-financials` to skip; enabled by default via `use_financials` in settings)
+7. Creates training labels using the selected prediction horizon (default 5 trading days): at horizon H, BUY/SELL thresholds are read from `signals.horizon_thresholds` in `config/settings.yaml` (e.g. ≥2.2% → BUY, ≤-2.2% → SELL at horizon 5)
+8. Builds 60-day rolling windows for sequence models (LSTM, Encoder-Decoder, Prophet) and tabular snapshots for XGBoost
+9. Splits chronologically (80% train / 20% validation — no shuffling to prevent data leakage)
 10. Selects best hyperparameters by **balanced accuracy** (average recall across SELL/HOLD/BUY — robust to class imbalance)
-11. Retrains final model(s) on the **full dataset** using best hyperparameters (n_estimators / epochs scaled up proportionally)
-12. Saves all model artefacts to `data/models/{SYMBOL}/`
+11. Retrains final model(s) on the **full dataset** using best hyperparameters
+12. Saves all model artefacts to `data/models/{SYMBOL}/` and generates interactive HTML plots to `data/plots/{SYMBOL}/`
 
-> **Note:** `train` fetches its own data directly from yfinance. Running `fetch-data` beforehand is not required and has no effect on training.
+> **Note:** `train` fetches its own data directly from yfinance. Running `fetch-data` beforehand is not required.
 
 **Model options** (`--models` / `-m`):
 
-| Selection | Behaviour |
-|---|---|
-| `lstm` (default) | Train LSTM only — captures temporal patterns across 60-timestep sequences |
-| `xgboost` | Train XGBoost only — fast, interpretable feature importances |
-| `lstm,xgboost` | Train both; combine via per-stock dynamic weights derived from validation accuracy |
+| Selection | Type | Description |
+|---|---|---|
+| `lstm` (default) | Classifier | Captures temporal patterns across 60-timestep rolling windows |
+| `xgboost` | Classifier | Fast, interpretable; uses tabular feature snapshots |
+| `encoder_decoder` | Regressor→signal | Predicts price ratios for each horizon step; converts to BUY/HOLD/SELL via thresholds |
+| `prophet` | Regressor→signal | Facebook Prophet time-series model with lag-safe exogenous regressors |
+| `lstm,xgboost` | Ensemble | Both classifiers; combined via dynamic weights from validation balanced accuracy |
+| `lstm,xgboost,encoder_decoder,prophet` | Ensemble | All four models; weights proportional to each model's validation balanced accuracy |
+
+> Any combination of the four model names works. For single-model selections, the weight is 1.0. For ensembles, each model's contribution is proportional to its validation balanced accuracy.
+
+**Prediction horizon** (`--horizon` / `-h`):
+
+| Value | BUY threshold | SELL threshold | Description |
+|---|---|---|---|
+| `1` | ≥1.0% | ≤-1.0% | Next-day signal |
+| `3` | ≥1.7% | ≤-1.7% | 3-day signal |
+| `5` (default) | ≥2.2% | ≤-2.2% | 1-week signal |
+| `7` | ≥2.6% | ≤-2.6% | 7-day signal |
+| `10` | ≥3.2% | ≤-3.2% | 2-week signal |
+
+Thresholds are configurable in `config/settings.yaml` under `signals.horizon_thresholds`. The horizon is saved in `meta.joblib` and automatically applied at prediction time.
 
 **Dependencies:** None on prior steps. Requires internet access to yfinance and optionally Google News RSS and a running Ollama server.
 
@@ -125,15 +142,27 @@ Trains one or more ML models (LSTM and/or XGBoost) per symbol. When multiple mod
 - Files written per symbol to `data/models/{SYMBOL}/` (only for selected models):
   - `lstm.pt` — PyTorch LSTM weights and architecture metadata
   - `xgboost.joblib` — trained XGBoost classifier with feature names
-  - `meta.joblib` — fitted StandardScalers, feature names, selected models, `trained_at` timestamp
+  - `encoder_decoder.pt` — PyTorch Encoder-Decoder weights
+  - `prophet.joblib` — fitted Prophet model with regressors
+  - `meta.joblib` — scalers, feature names, selected models, `trained_at` timestamp, `horizon`, `use_news`, `use_llm`, `use_financials`, `val_accuracy`, and per-model ensemble weights
+- Interactive HTML plots per symbol to `data/plots/{SYMBOL}/`:
+  - `train_plot.html` — training period actual vs predicted signals
+  - `val_plot.html` — full history with train/val split marker
+  - `pred_plot.html` — historical prices + future forecast
 
 ```bash
 stockpredict train -s RELIANCE.NS,TCS.NS,SBIN.NS        # Specific stocks
 stockpredict train                                        # All NIFTY 50
 stockpredict train -m lstm                               # LSTM only (default)
 stockpredict train -m xgboost                            # XGBoost only
-stockpredict train -m lstm,xgboost                       # Ensemble of both
-stockpredict train -s RELIANCE.NS --no-news --no-llm     # Technical-only (faster)
+stockpredict train -m encoder_decoder                    # Encoder-Decoder only
+stockpredict train -m prophet                            # Prophet only
+stockpredict train -m lstm,xgboost                       # Ensemble of LSTM + XGBoost
+stockpredict train -m lstm,xgboost,encoder_decoder,prophet  # All four models
+stockpredict train -s RELIANCE.NS -h 1                   # 1-day horizon
+stockpredict train -s RELIANCE.NS -h 10                  # 10-day horizon
+stockpredict train -s RELIANCE.NS --no-news --no-llm     # Technical + financials only (faster)
+stockpredict train -s RELIANCE.NS --no-financials        # No quarterly financial features
 stockpredict train -s RELIANCE.NS --start-date 2023-01-01 --end-date 2024-12-31
 ```
 
@@ -147,12 +176,15 @@ stockpredict train -s RELIANCE.NS --start-date 2023-01-01 --end-date 2024-12-31
 Loads the trained models for each symbol and generates BUY / HOLD / SELL signals with confidence scores. For each symbol it:
 
 1. Loads model artefacts from `data/models/{SYMBOL}/` — warns if the model is more than 30 days old
-2. Fetches the latest price data from yfinance and builds current features (same pipeline as training)
-3. Scales features using the saved StandardScaler
-4. Runs prediction using the model(s) the symbol was trained with; if multiple models were trained, combines them via per-stock dynamic weights saved during training
-5. Applies confidence thresholds: signals below 60% confidence are downgraded to HOLD; signals above 80% are upgraded to STRONG BUY / STRONG SELL
-6. Computes a short score (sell probability + RSI + MACD + SMA50) and flags short-selling candidates
-7. Runs the stock screener to produce top picks, sector momentum, and news alerts alongside the model signals
+2. Reads the feature flags (`use_news`, `use_llm`, `use_financials`) and `horizon` saved in `meta.joblib` — predictions always use the exact same feature set the model was trained on
+3. Fetches the latest price data from yfinance and builds current features using the stored feature set
+4. Scales features using the saved StandardScaler
+5. Runs prediction using the model(s) the symbol was trained with; if multiple models were trained, combines them via per-stock dynamic weights saved in `meta.joblib`
+6. Applies confidence thresholds: signals below 60% confidence are downgraded to HOLD; signals above 80% are upgraded to STRONG BUY / STRONG SELL
+7. Computes a short score (sell probability + RSI + MACD + SMA50) and flags short-selling candidates
+8. Runs the stock screener to produce top picks, sector momentum, and news alerts alongside the model signals
+
+> **Feature flags are not required at predict time.** The model remembers whether it was trained with news, LLM, and financial features and applies them automatically. There is no risk of feature mismatch between training and prediction.
 
 **Dependencies:** Trained model files must exist in `data/models/{SYMBOL}/` — run `train` first for each symbol you want to predict.
 
@@ -172,7 +204,6 @@ Loads the trained models for each symbol and generates BUY / HOLD / SELL signals
 stockpredict predict -s RELIANCE.NS,TCS.NS               # Specific stocks
 stockpredict predict                                      # All NIFTY 50
 stockpredict predict -s RELIANCE.NS --export              # Export results to CSV + JSON
-stockpredict predict --no-news --no-llm                   # Technical-only predictions
 ```
 
 ---
@@ -184,6 +215,8 @@ stockpredict predict --no-news --no-llm                   # Technical-only predi
 **What it does:**
 Produces a comprehensive report for a single stock combining the ML signal, technical indicator readings, LLM broker insights, and recent news headlines. It loads the trained model, generates a prediction, then sends the top 15 recent headlines to the local Ollama LLM which scores the stock across 10 dimensions (earnings outlook, competitive position, management quality, sector momentum, risk level, growth catalyst, valuation signal, institutional interest, macro impact, overall broker score) and produces a short narrative summary. LLM results are cached for 24 hours.
 
+Feature flags are loaded from the model's `meta.joblib` automatically, matching the conditions at training time.
+
 **Dependencies:** A trained model must exist for the symbol in `data/models/{SYMBOL}/` — run `train` first.
 
 **Output:**
@@ -193,7 +226,6 @@ Produces a comprehensive report for a single stock combining the ML signal, tech
 ```bash
 stockpredict analyze -s RELIANCE.NS                      # Full analysis
 stockpredict analyze -s RELIANCE.NS --no-llm             # Skip LLM broker analysis
-stockpredict analyze -s RELIANCE.NS --no-news            # Skip news features
 ```
 
 ---
@@ -349,6 +381,26 @@ stockpredict test-calculate-gain --export                # Export to JSON
 
 ---
 
+## Streamlit UI
+
+Launch the interactive web UI instead of the CLI:
+
+```bash
+streamlit run app.py
+```
+
+The UI mirrors all CLI functionality with additional visualisation. Key pages:
+
+| Page | Description |
+|------|-------------|
+| **Train** | Select symbols, model types, horizon (1/3/5/7/10 days), and feature flags (News, LLM, Financials). Runs training in the background and streams progress. |
+| **Predict** | Run predictions for trained symbols. Feature flags and horizon are loaded automatically from the model — no user input needed. Each row has an **ℹ️** button showing model metadata (trained date, horizon, val accuracy, models used, feature flags). Each row also has a **📊** button to view the interactive training plots. |
+| **Analyze** | Deep-dive analysis for a single stock with LLM broker scores and chart. |
+| **Suggest** | Screener-style ranked watchlist without requiring trained models. |
+| **Paper Trade** | Open/close positions, view portfolio, compute gain/loss. |
+
+---
+
 ## Dependency Summary
 
 | Step | Command | Depends On |
@@ -376,7 +428,7 @@ stockpredict test-calculate-gain --export                # Export to JSON
 | `shortlist` | Buy / Short / Trending tables | `shortlist.csv` | — |
 | `suggest` | Ranked stocks table | `suggestions.csv` | — |
 | `fetch-data` | Per-symbol row counts | — | — |
-| `train` | Training progress | — | `data/models/{SYMBOL}/lstm.pt`, `xgboost.joblib`, `meta.joblib` |
+| `train` | Training progress + val accuracy | `train_summary.csv` | `data/models/{SYMBOL}/lstm.pt`, `xgboost.joblib`, `encoder_decoder.pt`, `prophet.joblib`, `meta.joblib`; `data/plots/{SYMBOL}/train_plot.html`, `val_plot.html`, `pred_plot.html` |
 | `predict` | 5 signal tables | `signals.csv`, `short_candidates.csv`, `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv` | `data/processed/predictions_YYYY-MM-DD.csv/json` (with `--export`) |
 | `screen` | 4 screener tables | `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv`, `signals.csv`, `short_candidates.csv` | — |
 | `lookup` | Matched stocks with signals | `lookup.csv` | — |
@@ -388,6 +440,32 @@ stockpredict test-calculate-gain --export                # Export to JSON
 | `test-calculate-gain` | Summary + per-stock tables | `gain_summary.csv`, `gain_per_stock.csv` | `data/trades/report_YYYY-MM-DD.json` (with `--export`) |
 
 > All `data/reports/*.csv` files are overwritten on each run and are excluded from git.
+
+---
+
+## meta.joblib Contents
+
+Each trained symbol has a `data/models/{SYMBOL}/meta.joblib` file containing:
+
+| Field | Description |
+|-------|-------------|
+| `scaler` | Fitted `StandardScaler` for tabular features |
+| `seq_scaler` | Fitted `StandardScaler` for sequence (LSTM/ED) inputs |
+| `feature_names` | Ordered list of feature column names used during training |
+| `input_size` | Number of input features |
+| `selected_models` | List of model names trained (e.g. `["lstm", "xgboost"]`) |
+| `trained_at` | ISO timestamp of training completion |
+| `horizon` | Prediction horizon in trading days (1, 3, 5, 7, or 10) |
+| `use_news` | Whether news features were included during training |
+| `use_llm` | Whether LLM features were included during training |
+| `use_financials` | Whether quarterly financial features were included |
+| `val_accuracy` | Validation balanced accuracy achieved (or `None` for old models) |
+| `lstm_weight` | Ensemble weight for the LSTM model |
+| `xgboost_weight` | Ensemble weight for XGBoost |
+| `encoder_decoder_weight` | Ensemble weight for Encoder-Decoder |
+| `prophet_weight` | Ensemble weight for Prophet |
+
+> **Backward compatibility:** Models trained before the `horizon` / `use_*` fields were introduced will load correctly with safe defaults. Re-train to capture the new fields.
 
 ---
 

@@ -106,7 +106,7 @@ Controls the local LLM used for broker-style news analysis (overall scores, earn
 llm:
   provider: ollama
   ollama:
-    model: "llama3.1:8b"
+    model: "qwen2.5:7b"
     base_url: "http://localhost:11434"
     timeout: 120
   cache_dir: data/news_cache
@@ -155,7 +155,9 @@ features:
     atr_period: 14
     stoch_period: 14
   sequence_length: 60
-  prediction_horizon: 1
+  prediction_horizon: 5
+  use_financials: true
+  financial_announcement_lag_days: 45
 ```
 
 ### `features.technical`
@@ -179,23 +181,39 @@ Standard technical indicator parameters. These follow widely-used defaults; chan
 
 | Key | Default | Description |
 |---|---|---|
-| `sequence_length` | `60` | Number of past trading days fed into the LSTM as one input sequence (~3 months). XGBoost uses only the current day's snapshot. Increasing this requires proportionally more historical data. |
+| `sequence_length` | `60` | Number of past trading days fed into the LSTM / Encoder-Decoder as one input sequence (~3 months). XGBoost and Prophet use a different representation. Increasing this requires proportionally more historical data. |
 
 ### `features.prediction_horizon`
 
 | Key | Default | Description |
 |---|---|---|
-| `prediction_horizon` | `5` | How many trading days ahead the signal label is based on. The label is a **point-to-point return** (day `t` close vs day `t+horizon` close), not an average over the period. Changing this requires retraining all models. |
+| `prediction_horizon` | `5` | How many trading days ahead the signal label is based on. The label is a **point-to-point return** (day `t` close vs day `t+horizon` close), not an average over the period. **Changing this requires retraining all models.** |
 
-**Horizon options:**
+The horizon is selected per training run in the Streamlit UI (Train page → "Prediction horizon" selectbox) and is saved in each model's `meta.joblib`. At prediction time the horizon is loaded automatically from the saved model — the config value is only used as the default for the CLI.
 
-| Value | Meaning | Suitable for |
+**Supported horizon options (UI selectbox):**
+
+| Value | Meaning | Buy/Sell threshold | Suitable for |
+|---|---|---|---|
+| `1` | Next trading day | ±1.0% | Short-term / intraday-style signals |
+| `3` | 3 trading days | ±1.7% | Short swing trades |
+| `5` | Same day next week ← **default** | ±2.2% | Weekly swing trading |
+| `7` | ~1.5 calendar weeks | ±2.6% | Medium-term swing trading |
+| `10` | ~2 calendar weeks | ±3.2% | Positional trades |
+
+Thresholds widen with horizon following a √t volatility model. See [`signals.horizon_thresholds`](#signals-horizon_thresholds) to customise them.
+
+### `features.use_financials`
+
+| Key | Default | Description |
 |---|---|---|
-| `1` | Next trading day | Short-term / intraday-style signals |
-| `5` | Same day next week ← default | Weekly swing trading (lands on same weekday) |
-| `7` | ~2 calendar weeks | Medium-term swing trading |
-| `10` | ~2 calendar weeks | Positional trades |
-| `21` | ~1 calendar month | Long-term position building |
+| `use_financials` | `true` | Include quarterly financial report features (margins, growth, leverage, ROE, cash flow, EPS surprise, and report aging). Requires internet access to fetch earnings data via yfinance. |
+
+### `features.financial_announcement_lag_days`
+
+| Key | Default | Description |
+|---|---|---|
+| `financial_announcement_lag_days` | `45` | Days after a fiscal quarter-end before the results are assumed to be public knowledge (used when the actual announcement date is unknown). Typical NIFTY 50 range: 30–60 days. A conservative 45-day default avoids look-ahead bias. |
 
 ---
 
@@ -220,9 +238,19 @@ models:
     early_stopping_rounds: 20
     subsample: 0.8
     colsample_bytree: 0.8
+  encoder_decoder:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.3
+    learning_rate: 0.001
+    epochs: 50
+    batch_size: 32
+    patience: 10
+  prophet: {}
   ensemble:
     lstm_weight: 0.4
     xgboost_weight: 0.6
+  selected_models: ["lstm"]
   save_dir: data/models
   train_split: 0.8
   staleness_warning_days: 30
@@ -230,14 +258,14 @@ models:
 
 ### `models.lstm`
 
-These are the **search space defaults** used by the hyperparameter tuner. The tuner will try combinations around these values and pick the best; the winner is then used for the full-data retrain.
+These are the **search space defaults** used by the hyperparameter tuner. The tuner tries combinations of hidden size, dropout, and learning rate and picks the best; the winner is then used for the full-data retrain.
 
 | Key | Default | Description |
 |---|---|---|
-| `hidden_size` | `128` | Number of LSTM hidden units per layer. Tuner searches `[64, 128]`. |
+| `hidden_size` | `128` | Number of LSTM hidden units per layer. Tuner searches `[64, 128, 256]`. |
 | `num_layers` | `2` | Number of stacked LSTM layers. Not tuned; change here to fix for all runs. |
 | `dropout` | `0.3` | Dropout rate applied between LSTM layers and before the output head. Tuner searches `[0.2, 0.3]`. |
-| `learning_rate` | `0.001` | Adam optimiser learning rate. Tuner uses `0.001` as its fixed value. |
+| `learning_rate` | `0.001` | Adam optimiser learning rate. Tuner uses `[0.001, 0.0005]`. |
 | `epochs` | `50` | Maximum training epochs. Early stopping (via `patience`) usually stops before this. |
 | `batch_size` | `32` | Mini-batch size for gradient updates. |
 | `patience` | `10` | Early stopping patience — stops training if val loss does not improve for this many consecutive epochs. |
@@ -249,45 +277,87 @@ These are the **search space defaults** for the XGBoost tuner.
 | Key | Default | Description |
 |---|---|---|
 | `n_estimators` | `500` | Maximum number of boosting trees. Actual count is determined by early stopping during tuning; the final full-data model scales this up by `1 / train_split`. |
-| `max_depth` | `6` | Maximum tree depth. Tuner searches `[4, 6]`. Deeper trees capture more complex patterns but overfit more easily. |
+| `max_depth` | `6` | Maximum tree depth. Tuner searches `[3, 4, 6, 8]`. Deeper trees capture more complex patterns but overfit more easily. |
 | `learning_rate` | `0.05` | Shrinkage applied to each tree's contribution. Tuner searches `[0.05, 0.10]`. Lower values need more trees. |
 | `early_stopping_rounds` | `20` | Stop boosting if val loss does not improve for this many rounds during tuning. Disabled (`None`) for the final full-data retrain. |
 | `subsample` | `0.8` | Fraction of training rows sampled per tree. Reduces overfitting. |
 | `colsample_bytree` | `0.8` | Fraction of features sampled per tree. Reduces overfitting. |
 
-### `models.ensemble`
+### `models.encoder_decoder`
+
+Sequence-to-sequence LSTM that predicts a vector of `horizon` future price ratios (regression), then converts them to BUY/HOLD/SELL via a Gaussian CDF model.
 
 | Key | Default | Description |
 |---|---|---|
-| `lstm_weight` | `0.4` | Weight given to LSTM probability outputs in the weighted average. |
-| `xgboost_weight` | `0.6` | Weight given to XGBoost probability outputs. Must sum to 1.0 with `lstm_weight`. XGBoost gets higher weight by default because it tends to be more stable on tabular features. |
+| `hidden_size` | `128` | Encoder and decoder LSTM hidden units. Tuner searches `[64, 128, 256]`. |
+| `num_layers` | `2` | Stacked LSTM layers in both encoder and decoder. |
+| `dropout` | `0.3` | Dropout rate. Tuner searches `[0.2, 0.3]`. |
+| `learning_rate` | `0.001` | Adam learning rate. |
+| `epochs` | `50` | Maximum epochs; early stopping applies. |
+| `batch_size` | `32` | Mini-batch size. |
+| `patience` | `10` | Early stopping patience. |
+
+### `models.prophet`
+
+```yaml
+prophet: {}
+```
+
+Prophet has no architecture hyperparameters set here. Instead, `changepoint_prior_scale` and `seasonality_prior_scale` are grid-searched during tuning. The best values are found automatically and saved with the model.
+
+### `models.ensemble`
+
+When multiple models are selected, their probability outputs are combined via a **dynamic weighted average** derived from each model's individual validation balanced accuracy — better models automatically receive higher weight. The weights below are only used as a static fallback if dynamic weights cannot be computed.
+
+| Key | Default | Description |
+|---|---|---|
+| `lstm_weight` | `0.4` | Fallback weight for LSTM in the weighted average. |
+| `xgboost_weight` | `0.6` | Fallback weight for XGBoost. |
 
 ### `models` (top-level)
 
 | Key | Default | Description |
 |---|---|---|
-| `selected_models` | `["lstm"]` | List of models to train and use for prediction. Multiple entries → ensemble (weighted average). See options below. |
-| `save_dir` | `data/models` | Root directory where trained model files are saved (`lstm.pt`, `xgboost.joblib`, `meta.joblib` per symbol). |
-| `train_split` | `0.8` | Fraction of data used as the training split during hyperparameter tuning. The remaining 20% is the validation set. Final models are retrained on 100% of data. |
-| `staleness_warning_days` | `30` | If a saved model is older than this many days, the system warns that it may be stale and should be retrained. |
+| `selected_models` | `["lstm"]` | Default list of models to train. Overridden per run from the UI (multiselect) or CLI (`--models`). Multiple entries → ensemble. |
+| `save_dir` | `data/models` | Root directory for trained model files. |
+| `train_split` | `0.8` | Fraction of data used for training during hyperparameter search. The remaining 20% is the validation set. Final models are retrained on 100% of data. |
+| `staleness_warning_days` | `30` | Warn in the Predict UI if a saved model is older than this many days. |
 
 **`selected_models` options:**
 
 | Value | Description |
 |---|---|
-| `["lstm"]` | LSTM only. Captures temporal patterns across the 60-timestep feature sequences. |
-| `["xgboost"]` | XGBoost only. Fast training, interpretable feature importances, no sequence context. |
-| `["lstm", "xgboost"]` | Ensemble — both models trained; probability outputs combined using per-stock dynamic weights derived from individual validation accuracies. |
+| `["lstm"]` | LSTM sequence classifier. Captures temporal patterns across 60-day feature windows. |
+| `["xgboost"]` | XGBoost tabular classifier. Fast training, interpretable feature importances, no sequence context. |
+| `["encoder_decoder"]` | Encoder-Decoder LSTM regressor. Predicts multi-step price ratios; converts to BUY/HOLD/SELL. |
+| `["prophet"]` | Facebook Prophet time-series model. Captures seasonality and trend; outputs a probabilistic signal. |
+| `["lstm", "xgboost"]` | Two-model ensemble, dynamically weighted by validation accuracy. |
+| `["lstm", "xgboost", "encoder_decoder", "prophet"]` | Full ensemble — all four models combined. |
 
-Can also be overridden at runtime via CLI (`--models lstm,xgboost`) or the Train UI (multiselect).
+> Each saved model records the models it was trained with and the features used. Prediction always matches training conditions regardless of the current config value.
 
-> Changing `selected_models` requires retraining — each saved model records what was trained and loads the correct files regardless of the current config.
+**What is saved in `meta.joblib` per symbol:**
+
+| Field | Description |
+|---|---|
+| `scaler` | Fitted `StandardScaler` for tabular features |
+| `seq_scaler` | Fitted `StandardScaler` for sequence features |
+| `feature_names` | Ordered list of feature column names used during training |
+| `input_size` | Feature dimension |
+| `lstm_weight` / `xgb_weight` / `ed_weight` / `prophet_weight` | Dynamic ensemble weights derived from validation accuracy |
+| `selected_models` | List of model IDs that were trained |
+| `trained_at` | ISO-format timestamp of when training completed |
+| `horizon` | Prediction horizon (days) used during training |
+| `use_news` | Whether news features were enabled during training |
+| `use_llm` | Whether LLM features were enabled during training |
+| `use_financials` | Whether financial report features were enabled during training |
+| `val_accuracy` | Weighted validation balanced accuracy at training time |
 
 ---
 
 ## 8. `signals`
 
-Controls how model probability outputs are converted into trading signals.
+Controls how model probability outputs are converted into trading signals, and defines the BUY/SELL/HOLD label thresholds used during training.
 
 ```yaml
 signals:
@@ -296,17 +366,51 @@ signals:
   short_confidence_threshold: 0.7
   buy_return_threshold: 0.01
   sell_return_threshold: -0.01
+  horizon_thresholds:
+    1:  [ 0.010, -0.010]
+    2:  [ 0.014, -0.014]
+    3:  [ 0.017, -0.017]
+    4:  [ 0.020, -0.020]
+    5:  [ 0.022, -0.022]
+    6:  [ 0.024, -0.024]
+    7:  [ 0.026, -0.026]
+    8:  [ 0.028, -0.028]
+    9:  [ 0.030, -0.030]
+    10: [ 0.032, -0.032]
 ```
+
+### Confidence thresholds
 
 | Key | Default | Description |
 |---|---|---|
 | `confidence_threshold` | `0.6` | Minimum predicted probability for a BUY or SELL signal to be acted on. Below this the signal is downgraded to HOLD. |
 | `strong_threshold` | `0.8` | Probability above which a signal is elevated to STRONG BUY or STRONG SELL. |
-| `short_confidence_threshold` | `0.7` | Minimum confidence required to include a stock in the "Short" shortlist category. |
-| `buy_return_threshold` | `0.01` | **Label threshold:** a day (or horizon period) with return ≥ +1% is labelled BUY during training. |
-| `sell_return_threshold` | `-0.01` | **Label threshold:** a day (or horizon period) with return ≤ −1% is labelled SELL during training. Returns between the two thresholds are labelled HOLD. |
+| `short_confidence_threshold` | `0.7` | Minimum confidence required to include a stock in the short-selling candidate list. |
 
-**Note:** `buy_return_threshold` and `sell_return_threshold` affect training labels — changing them requires retraining all models.
+### `signals.horizon_thresholds` (label thresholds)
+
+These are the **training label thresholds** — they determine what counts as a BUY or SELL during dataset creation. Each row is `horizon_days: [buy_threshold, sell_threshold]`.
+
+| Horizon | BUY if `horizon_return ≥` | SELL if `horizon_return ≤` | Else |
+|---|---|---|---|
+| 1 day | +1.0% | −1.0% | HOLD |
+| 3 days | +1.7% | −1.7% | HOLD |
+| 5 days | +2.2% | −2.2% | HOLD |
+| 7 days | +2.6% | −2.6% | HOLD |
+| 10 days | +3.2% | −3.2% | HOLD |
+
+**Design:** thresholds scale as √horizon from a ±1% base at horizon=1, matching how volatility compounds under a random walk assumption. Wider bands at longer horizons prevent the HOLD class from collapsing.
+
+**Editing:** you can widen or narrow the HOLD band by changing any entry here without touching code. **Changing thresholds requires retraining** — the labels embedded in the training data will differ.
+
+### `signals.buy_return_threshold` / `sell_return_threshold`
+
+| Key | Default | Description |
+|---|---|---|
+| `buy_return_threshold` | `0.01` | Fallback label threshold used only if `horizon_thresholds` is missing from the config. |
+| `sell_return_threshold` | `-0.01` | Fallback label threshold (same condition). |
+
+> In normal use these fallbacks are never reached because `horizon_thresholds` covers all supported horizons (1–10).
 
 ---
 
@@ -367,11 +471,14 @@ paper_trading:
 
 | Goal | Setting | Suggested value |
 |---|---|---|
-| Predict next day instead of next week | `features.prediction_horizon` | `1` |
-| Predict 2 weeks out | `features.prediction_horizon` | `10` |
+| Default to next-day predictions | `features.prediction_horizon` | `1` |
+| Default to 2-week predictions | `features.prediction_horizon` | `10` |
+| Widen HOLD band (fewer BUY/SELL signals) | `signals.horizon_thresholds` | Increase absolute values, e.g. `5: [0.030, -0.030]` |
+| Narrow HOLD band (more signals) | `signals.horizon_thresholds` | Decrease absolute values, e.g. `5: [0.015, -0.015]` |
 | Switch LLM to Llama 3.1 | `llm.ollama.model` | `llama3.1:8b` |
-| Reduce HOLD class bias (tighter band) | `signals.buy_return_threshold` / `sell_return_threshold` | `0.005` / `-0.005` |
 | Speed up training (fewer trees) | `models.xgboost.n_estimators` | `200` |
 | Reduce LSTM overfitting | `models.lstm.dropout` | `0.4` or `0.5` |
 | Keep news fresher | `news.cache_expiry_hours` | `2` |
 | Warn earlier about stale models | `models.staleness_warning_days` | `14` |
+| Disable financial features globally | `features.use_financials` | `false` |
+| Extend financial data lag (conservative) | `features.financial_announcement_lag_days` | `60` |
