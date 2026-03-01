@@ -97,11 +97,26 @@ models:
     epochs: 50
     batch_size: 32
     patience: 10
+  dqn:
+    hidden_sizes: [256, 128]   # MLP hidden layer widths (deepened by adding more entries)
+    dropout: 0.2
+    learning_rate: 0.001
+    batch_size: 64             # replay-buffer mini-batch size
+    buffer_size: 10000         # maximum transitions stored in the replay buffer
+    min_buffer_size: 64        # min buffer occupancy before gradient updates begin
+    target_update_freq: 100    # gradient steps between target-network syncs
+    discount_factor: 0.99      # future-reward discount γ (higher than tabular QL)
+    epsilon_start: 1.0         # initial exploration rate
+    epsilon_end: 0.01          # minimum exploration rate
+    epsilon_decay: 0.995       # per-episode ε decay factor
+    n_episodes: 10             # passes over training time-series
+    transaction_cost: 0.001    # 0.1% per trade (open or close)
+    temperature: 0.5           # softmax temperature: lower = more peaked predictions
   ensemble:
     lstm_weight: 0.4
     xgboost_weight: 0.6
   selected_models: ["lstm"]  # list of models to train/use; multiple = ensemble
-                             # available: lstm, xgboost, encoder_decoder, prophet, tft, qlearning
+                             # available: lstm, xgboost, encoder_decoder, prophet, tft, qlearning, dqn
   save_dir: data/models
   train_split: 0.8
   staleness_warning_days: 30

@@ -32,6 +32,10 @@ def _get_ql_type():
     from stock_prediction.models.qlearning_model import QLearningPredictor
     return QLearningPredictor
 
+def _get_dqn_type():
+    from stock_prediction.models.dqn_model import DQNPredictor
+    return DQNPredictor
+
 
 @dataclass
 class EnsemblePrediction:
@@ -55,10 +59,13 @@ class EnsemblePrediction:
     qlearning_probs: dict[str, float] = field(
         default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
     )
+    dqn_probs: dict[str, float] = field(
+        default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
+    )
 
 
 class EnsembleModel:
-    """Weighted-average ensemble of up to six model types.
+    """Weighted-average ensemble of up to seven model types.
 
     Supported models (any combination):
       - lstm           : LSTM sequence classifier
@@ -67,6 +74,7 @@ class EnsembleModel:
       - prophet        : Prophet time-series regressor (single forecast broadcast)
       - tft            : Temporal Fusion Transformer regressor (ratios → probs via Gaussian CDF)
       - qlearning      : Tabular Q-learning agent (Q-values → softmax probs)
+      - dqn            : Deep Q-Network agent (Q-values → softmax probs)
 
     At least one model must be provided.  The weights must sum to 1.0; the
     caller (ModelTrainer) derives them dynamically from validation balanced
@@ -81,18 +89,21 @@ class EnsembleModel:
         prophet=None,
         tft=None,
         qlearning=None,
+        dqn=None,
         lstm_weight: float | None = None,
         xgboost_weight: float | None = None,
         encoder_decoder_weight: float | None = None,
         prophet_weight: float | None = None,
         tft_weight: float | None = None,
         qlearning_weight: float | None = None,
+        dqn_weight: float | None = None,
     ):
         if (lstm is None and xgboost is None and encoder_decoder is None
-                and prophet is None and tft is None and qlearning is None):
+                and prophet is None and tft is None and qlearning is None
+                and dqn is None):
             raise ValueError(
-                "At least one of lstm / xgboost / encoder_decoder / prophet / tft / qlearning "
-                "must be provided"
+                "At least one of lstm / xgboost / encoder_decoder / prophet / tft / "
+                "qlearning / dqn must be provided"
             )
 
         self.lstm = lstm
@@ -101,6 +112,7 @@ class EnsembleModel:
         self.prophet = prophet
         self.tft = tft
         self.qlearning = qlearning
+        self.dqn = dqn
 
         self.lstm_weight = lstm_weight if lstm_weight is not None else (
             get_setting("models", "ensemble", "lstm_weight", default=0.4)
@@ -112,6 +124,7 @@ class EnsembleModel:
         self.prophet_weight = prophet_weight if prophet_weight is not None else 0.0
         self.tft_weight = tft_weight if tft_weight is not None else 0.0
         self.qlearning_weight = qlearning_weight if qlearning_weight is not None else 0.0
+        self.dqn_weight = dqn_weight if dqn_weight is not None else 0.0
 
     def predict(
         self, X_seq: np.ndarray | None, X_tab: np.ndarray | None
@@ -144,6 +157,7 @@ class EnsembleModel:
         prophet_probs = zeros.copy()
         tft_probs     = zeros.copy()
         ql_probs      = zeros.copy()
+        dqn_probs     = zeros.copy()
 
         if self.lstm is not None and X_seq is not None:
             lstm_probs = self.lstm.predict_proba(X_seq)
@@ -175,6 +189,12 @@ class EnsembleModel:
             ql_probs = self.qlearning.predict_proba(X_seq)
             weighted_sum += self.qlearning_weight * ql_probs
             total_weight += self.qlearning_weight
+
+        if self.dqn is not None and X_seq is not None:
+            # DQN uses last timestep of the sequence as continuous state
+            dqn_probs = self.dqn.predict_proba(X_seq)
+            weighted_sum += self.dqn_weight * dqn_probs
+            total_weight += self.dqn_weight
 
         ensemble_probs = weighted_sum / max(total_weight, 1e-8)
 
@@ -221,6 +241,11 @@ class EnsembleModel:
                         "SELL": float(ql_probs[i][0]),
                         "HOLD": float(ql_probs[i][1]),
                         "BUY":  float(ql_probs[i][2]),
+                    },
+                    dqn_probs={
+                        "SELL": float(dqn_probs[i][0]),
+                        "HOLD": float(dqn_probs[i][1]),
+                        "BUY":  float(dqn_probs[i][2]),
                     },
                 )
             )
