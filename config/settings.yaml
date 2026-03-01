@@ -88,11 +88,23 @@ signals:
   confidence_threshold: 0.6
   strong_threshold: 0.8
   short_confidence_threshold: 0.7
-  # buy/sell thresholds below are fallbacks only.
-  # The pipeline auto-selects per-horizon thresholds (sqrt volatility scaling)
-  # from HORIZON_THRESHOLDS in pipeline.py for horizons 1-10.
   buy_return_threshold: 0.01
   sell_return_threshold: -0.01
+  # Per-horizon BUY / SELL thresholds.
+  # Format: horizon_days: [buy_threshold, sell_threshold]
+  # Based on sqrt(t) volatility scaling from a ±1% base at horizon 1.
+  # Edit these to widen/narrow the HOLD band without retraining.
+  horizon_thresholds:
+    1:  [ 0.010, -0.010]
+    2:  [ 0.014, -0.014]
+    3:  [ 0.017, -0.017]
+    4:  [ 0.020, -0.020]
+    5:  [ 0.022, -0.022]
+    6:  [ 0.024, -0.024]
+    7:  [ 0.026, -0.026]
+    8:  [ 0.028, -0.028]
+    9:  [ 0.030, -0.030]
+    10: [ 0.032, -0.032]
 
 screener:
   volume_spike_threshold: 1.5

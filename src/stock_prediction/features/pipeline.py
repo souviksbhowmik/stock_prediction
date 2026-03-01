@@ -19,10 +19,10 @@ from stock_prediction.utils.logging import get_logger
 
 logger = get_logger("features.pipeline")
 
-# Per-horizon buy/sell thresholds derived from √t volatility scaling
-# (base ±1% at horizon=1, scaled by √horizon for longer horizons).
-# Restricted to horizons 1-10; values are (buy_thresh, sell_thresh).
-HORIZON_THRESHOLDS: dict[int, tuple[float, float]] = {
+# Per-horizon buy/sell thresholds — loaded from config/settings.yaml
+# (signals.horizon_thresholds).  This dict is the hard-coded fallback used
+# when the config entry is absent (e.g. older installs).
+_HORIZON_THRESHOLDS_DEFAULT: dict[int, tuple[float, float]] = {
     1:  ( 0.010, -0.010),
     2:  ( 0.014, -0.014),
     3:  ( 0.017, -0.017),
@@ -34,6 +34,18 @@ HORIZON_THRESHOLDS: dict[int, tuple[float, float]] = {
     9:  ( 0.030, -0.030),
     10: ( 0.032, -0.032),
 }
+
+
+def _get_horizon_thresholds() -> dict[int, tuple[float, float]]:
+    """Return buy/sell thresholds keyed by horizon, sourced from config."""
+    cfg = get_setting("signals", "horizon_thresholds")
+    if cfg:
+        return {int(k): (float(v[0]), float(v[1])) for k, v in cfg.items()}
+    return _HORIZON_THRESHOLDS_DEFAULT
+
+
+# Public alias kept for any external code that imports HORIZON_THRESHOLDS directly.
+HORIZON_THRESHOLDS: dict[int, tuple[float, float]] = _get_horizon_thresholds()
 
 
 class FeaturePipeline:
@@ -193,7 +205,7 @@ class FeaturePipeline:
                 "Update config/settings.yaml."
             )
 
-        buy_thresh, sell_thresh = HORIZON_THRESHOLDS[horizon]
+        buy_thresh, sell_thresh = _get_horizon_thresholds()[horizon]
         logger.info(
             f"Labelling with horizon={horizon}d, "
             f"buy>={buy_thresh:.1%}, sell<={sell_thresh:.1%}"
