@@ -43,6 +43,7 @@ def generate_plots(
     prophet_pred_closes: np.ndarray | None = None,
     prophet_future_dates: pd.DatetimeIndex | None = None,
     actual_signals: np.ndarray | None = None,
+    predicted_signals: np.ndarray | None = None,
     save_dir: Path | None = None,
 ) -> dict[str, Path]:
     """Generate and save three HTML Plotly plots for a trained stock.
@@ -63,8 +64,13 @@ def generate_plots(
                         ``horizon`` business days (shape (horizon,)).
     prophet_future_dates: Business-day DatetimeIndex of length ``horizon``
                          corresponding to ``prophet_pred_closes``.
-    actual_signals   : (n_samples,) signal labels from prepare_training_data,
+    actual_signals   : (n_samples,) true signal labels from prepare_training_data,
                        starting at close-array index (n - n_samples).
+                       Shown as filled circles (actual outcomes).
+    predicted_signals: (n_samples,) signal labels predicted by the trained
+                       model (LSTM / XGBoost) on the full dataset.
+                       Shown as triangles so they can be compared with the
+                       actual outcomes at a glance.
     save_dir         : Directory under which a per-symbol subdirectory is
                        created (default ``data/plots``).
 
@@ -103,15 +109,22 @@ def generate_plots(
         ed_pred_close = ed_close
 
     # ── Align actual_signals to full close-array indices ──────────────────
+    def _align_signals(signals: np.ndarray) -> np.ndarray:
+        full = np.full(n, -1, dtype=np.int64)
+        start = n - len(signals)
+        if start >= 0:
+            full[start:] = signals
+        else:
+            full[:] = signals[-n:]
+        return full
+
     sig_arr: np.ndarray | None = None
     if actual_signals is not None and len(actual_signals) > 0:
-        sig_full = np.full(n, -1, dtype=np.int64)
-        start = n - len(actual_signals)
-        if start >= 0:
-            sig_full[start:] = actual_signals
-        else:
-            sig_full[:] = actual_signals[-n:]
-        sig_arr = sig_full
+        sig_arr = _align_signals(actual_signals)
+
+    pred_sig_arr: np.ndarray | None = None
+    if predicted_signals is not None and len(predicted_signals) > 0:
+        pred_sig_arr = _align_signals(predicted_signals)
 
     # ── Helper builders ───────────────────────────────────────────────────
     def _line(x, y, name, color, dash=None, width=1.5):
@@ -121,6 +134,7 @@ def generate_plots(
         )
 
     def _signal_traces(mask):
+        """Actual-outcome signal markers — filled circles."""
         if sig_arr is None:
             return []
         out = []
@@ -130,8 +144,31 @@ def generate_plots(
                 continue
             out.append(go.Scatter(
                 x=list(dates_arr[m]), y=list(close[m]), mode="markers",
-                name=_SIGNAL_LABEL[sv],
-                marker=dict(color=color, size=5, opacity=0.75),
+                name=f"Actual {_SIGNAL_LABEL[sv]}",
+                marker=dict(color=color, size=5, opacity=0.75, symbol="circle"),
+                showlegend=True,
+            ))
+        return out
+
+    _PRED_SYMBOL = {0: "triangle-down", 1: "diamond", 2: "triangle-up"}
+
+    def _predicted_signal_traces(mask):
+        """Model-predicted signal markers — triangles (BUY ▲, SELL ▼)."""
+        if pred_sig_arr is None:
+            return []
+        out = []
+        for sv, color in _SIGNAL_COLOR.items():
+            m = mask & (pred_sig_arr == sv)
+            if not m.any():
+                continue
+            out.append(go.Scatter(
+                x=list(dates_arr[m]), y=list(close[m]), mode="markers",
+                name=f"Pred {_SIGNAL_LABEL[sv]}",
+                marker=dict(
+                    color=color, size=7, opacity=0.55,
+                    symbol=_PRED_SYMBOL[sv],
+                    line=dict(color="white", width=0.5),
+                ),
                 showlegend=True,
             ))
         return out
@@ -171,6 +208,8 @@ def generate_plots(
 
     for t in _signal_traces(tr_mask):
         fig_train.add_trace(t)
+    for t in _predicted_signal_traces(tr_mask):
+        fig_train.add_trace(t)
 
     fig_train.update_layout(
         title=f"{symbol} — Training Period (horizon={horizon}d)",
@@ -199,6 +238,8 @@ def generate_plots(
         ))
 
     for t in _signal_traces(full_mask):
+        fig_val.add_trace(t)
+    for t in _predicted_signal_traces(full_mask):
         fig_val.add_trace(t)
 
     if split_date_str:
@@ -236,6 +277,11 @@ def generate_plots(
             line=dict(color="#8b5cf6", width=2, dash="dot"),
             marker=dict(size=7),
         ))
+
+    for t in _signal_traces(np.ones(n, dtype=bool)):
+        fig_pred.add_trace(t)
+    for t in _predicted_signal_traces(np.ones(n, dtype=bool)):
+        fig_pred.add_trace(t)
 
     # ED future forecast — use last regression sample's ratios
     if ed_pred_ratios is not None and len(ed_pred_ratios) > 0:

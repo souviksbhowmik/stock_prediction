@@ -65,6 +65,9 @@ class ModelTrainer:
         use_llm: bool = True,
         use_financials: bool = True,
     ):
+        self.use_news = use_news
+        self.use_llm = use_llm
+        self.use_financials = use_financials
         self.pipeline = FeaturePipeline(
             use_news=use_news, use_llm=use_llm, use_financials=use_financials
         )
@@ -81,7 +84,7 @@ class ModelTrainer:
         start_date: str | None = None,
         end_date: str | None = None,
         selected_models: list[str] | None = None,
-    ) -> tuple[EnsembleModel | None, float | None]:
+    ) -> tuple[EnsembleModel | None, float | None, dict]:
         """Train models for a single stock.
 
         Pipeline
@@ -395,6 +398,11 @@ class ModelTrainer:
             full_scaler, full_seq_scaler, feature_names,
             lstm_weight, xgb_weight, ed_weight, prophet_weight,
             selected_models, n_features,
+            horizon=horizon,
+            use_news=self.use_news,
+            use_llm=self.use_llm,
+            use_financials=self.use_financials,
+            val_accuracy=val_accuracy,
         )
 
         # ── 8. Generate time-series plots ────────────────────────────────
@@ -417,6 +425,21 @@ class ModelTrainer:
                 prophet_final._future_pred_dates if prophet_final is not None else None
             )
 
+            # Model-predicted signals on the full training dataset.
+            # LSTM/XGBoost are classifiers; we show their predictions as
+            # triangle markers so the user can compare predicted vs actual.
+            predicted_signals_for_plot: np.ndarray | None = None
+            try:
+                if lstm_final is not None and X_seq_full_s is not None and len(X_seq_full_s) > 0:
+                    predicted_signals_for_plot = lstm_final.predict(X_seq_full_s)
+                elif xgb_final is not None and X_tab_full_s is not None and len(X_tab_full_s) > 0:
+                    predicted_signals_for_plot = xgb_final.predict(X_tab_full_s)
+                elif ed_final is not None and ed_ratios_for_plot is not None:
+                    # X_seq_reg_full_s was built just above when ed_ratios_for_plot was set
+                    predicted_signals_for_plot = ed_final.predict(X_seq_reg_full_s)
+            except Exception as pe:
+                logger.warning(f"Could not generate predicted signals for plot: {pe}")
+
             if dates_all is not None and close_all is not None:
                 plot_save_dir = Path(get_setting("models", "save_dir", default="data/models")).parent / "plots"
                 train_end_for_plot = (
@@ -434,6 +457,7 @@ class ModelTrainer:
                     prophet_pred_closes=prophet_pred_closes,
                     prophet_future_dates=prophet_future_dates,
                     actual_signals=labels,
+                    predicted_signals=predicted_signals_for_plot,
                     save_dir=plot_save_dir,
                 )
                 plot_paths = {k: str(v) for k, v in raw_paths.items()}
@@ -592,12 +616,20 @@ class ModelTrainer:
     # Model persistence
     # =========================================================================
 
+    def load_model_meta(self, symbol: str) -> dict:
+        """Load only meta.joblib for a symbol without loading model weights."""
+        model_dir = self.save_dir / symbol.replace(".", "_")
+        meta_path = model_dir / "meta.joblib"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Models not found for {symbol} in {model_dir}")
+        return joblib.load(meta_path)
+
     def load_models(
         self, symbol: str
-    ) -> tuple[EnsembleModel, StandardScaler, StandardScaler, int | None]:
+    ) -> tuple[EnsembleModel, StandardScaler, StandardScaler, int | None, dict]:
         """Load trained models for a symbol.
 
-        Returns (ensemble, scaler, seq_scaler, model_age_days).
+        Returns (ensemble, scaler, seq_scaler, model_age_days, meta).
         Handles three legacy formats in ``selected_models`` for backward compat.
         """
         model_dir = self.save_dir / symbol.replace(".", "_")
@@ -665,7 +697,7 @@ class ModelTrainer:
             trained_dt = datetime.fromisoformat(trained_at)
             model_age_days = (datetime.now() - trained_dt).days
 
-        return ensemble, meta["scaler"], meta["seq_scaler"], model_age_days
+        return ensemble, meta["scaler"], meta["seq_scaler"], model_age_days, meta
 
     def _save_models(
         self,
@@ -683,6 +715,11 @@ class ModelTrainer:
         prophet_weight: float,
         selected_models: list[str],
         input_size: int,
+        horizon: int = 5,
+        use_news: bool = True,
+        use_llm: bool = True,
+        use_financials: bool = True,
+        val_accuracy: float | None = None,
     ) -> None:
         model_dir = self.save_dir / symbol.replace(".", "_")
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -704,6 +741,11 @@ class ModelTrainer:
                 "prophet_weight":  prophet_weight,
                 "selected_models": selected_models,
                 "trained_at":      datetime.now().isoformat(),
+                "horizon":         horizon,
+                "use_news":        use_news,
+                "use_llm":         use_llm,
+                "use_financials":  use_financials,
+                "val_accuracy":    val_accuracy,
             },
             model_dir / "meta.joblib",
         )

@@ -94,6 +94,7 @@ for _key in (
     "train_results",
     "predict_signals",
     "predict_warnings",
+    "predict_signal_metas",
     "portfolio_trades",
     "gain_report",
 ):
@@ -238,11 +239,15 @@ def _run_training_bg(
     use_llm: bool,
     use_financials: bool,
     selected_models: list[str],
+    horizon: int,
     progress: dict,
 ) -> None:
     """Runs in a daemon thread — keeps going even if the user navigates away."""
     try:
         from stock_prediction.models.trainer import ModelTrainer
+        from stock_prediction.config import load_settings
+        # Override horizon in the cached config so all pipeline calls use it
+        load_settings()["features"]["prediction_horizon"] = horizon
         trainer = ModelTrainer(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
         for i, sym in enumerate(symbol_list):
             if progress.get("cancelled"):
@@ -305,23 +310,40 @@ def _add_sym_to_input(session_key: str, symbol: str) -> None:
     st.session_state[session_key] = ",".join(existing)
 
 
-def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm, use_financials=True):
-    """Shared prediction logic — returns TradingSignal or raises."""
+def _predict_for_symbol(symbol, trainer, signal_gen):
+    """Shared prediction logic — returns (TradingSignal, model_age, meta, df) or raises.
+
+    Feature flags (use_news / use_llm / use_financials) and horizon are loaded
+    from the model's saved meta so prediction always matches training conditions.
+    """
     from stock_prediction.features.pipeline import FeaturePipeline
-    from stock_prediction.config import get_setting
     import numpy as np
 
-    ensemble, scaler, seq_scaler, model_age = trainer.load_models(symbol)
+    ensemble, scaler, seq_scaler, model_age, meta = trainer.load_models(symbol)
+
+    use_news       = meta.get("use_news", True)
+    use_llm        = meta.get("use_llm", True)
+    use_financials = meta.get("use_financials", True)
+    horizon        = meta.get("horizon", 5)
+    feature_names  = meta.get("feature_names", [])
+
     pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
     df = pipeline.build_features(symbol)
 
     if df.empty:
         raise ValueError("No feature data returned")
 
-    horizon = int(get_setting("features", "prediction_horizon", default=1))
     label_cols = {"return_1d", "return_5d", f"return_{horizon}d", "signal"}
-    feature_cols = [c for c in df.columns if c not in label_cols]
-    features = df[feature_cols].values
+
+    # Use training feature columns in training order for scaler compatibility
+    if feature_names:
+        available = [c for c in feature_names if c in df.columns]
+        features = df[available].values if available else df[
+            [c for c in df.columns if c not in label_cols]
+        ].values
+    else:
+        features = df[[c for c in df.columns if c not in label_cols]].values
+
     seq_len = pipeline.sequence_length
 
     if len(features) < seq_len:
@@ -339,7 +361,7 @@ def _predict_for_symbol(symbol, trainer, signal_gen, use_news, use_llm, use_fina
         for c in ["RSI", "MACD_Histogram", "Price_SMA50_Ratio"]
         if c in df.columns
     }
-    return signal_gen.generate(symbol, pred, tech), model_age, df
+    return signal_gen.generate(symbol, pred, tech), model_age, meta, df
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
@@ -595,9 +617,8 @@ def page_lookup() -> None:
 
             for symbol, name in sorted(matched.items()):
                 try:
-                    sig, model_age, _ = _predict_for_symbol(
-                        symbol, trainer, signal_gen,
-                        use_news=False, use_llm=False,
+                    sig, model_age, _, __ = _predict_for_symbol(
+                        symbol, trainer, signal_gen
                     )
                     rows.append({
                         "Symbol":     symbol,
@@ -719,6 +740,53 @@ def _show_plots_popup(symbol: str, plot_paths: dict) -> None:
                 st.info(f"No {label} plot was generated for {symbol}.")
 
 
+# ─── Model info dialog ────────────────────────────────────────────────────────
+@st.dialog("Model Info", width="small")
+def _show_model_info_popup(symbol: str, meta: dict) -> None:
+    """Modal dialog showing saved training metadata for a symbol."""
+    from datetime import datetime as _dt
+    st.markdown(f"### {symbol}")
+
+    trained_at = meta.get("trained_at", "")
+    if trained_at:
+        date_str = trained_at[:10]
+        try:
+            age_days = (_dt.now() - _dt.fromisoformat(trained_at)).days
+            age_str = f"{age_days} day{'s' if age_days != 1 else ''} ago"
+        except ValueError:
+            age_str = ""
+        st.write(f"**Trained:** {date_str}" + (f"  ·  {age_str}" if age_str else ""))
+    else:
+        st.write("**Trained:** unknown")
+
+    st.write(f"**Horizon:** {meta.get('horizon', '—')} trading days")
+
+    val_acc = meta.get("val_accuracy")
+    acc_str = f"{val_acc:.4f}" if val_acc is not None else "— (retrain to record)"
+    st.write(f"**Val accuracy:** {acc_str}")
+
+    st.markdown("**Models & ensemble weights:**")
+    selected = meta.get("selected_models", [])
+    weight_keys = {
+        "lstm": "lstm_weight", "xgboost": "xgb_weight",
+        "encoder_decoder": "ed_weight", "prophet": "prophet_weight",
+    }
+    for m in selected:
+        w = meta.get(weight_keys.get(m, ""), 0.0)
+        bar = "█" * int(round(w * 10))
+        st.write(f"  • **{m}** — {w:.1%}  `{bar}`")
+
+    st.markdown("**Features used during training:**")
+    feats = [
+        ("News",       meta.get("use_news", True)),
+        ("LLM",        meta.get("use_llm", True)),
+        ("Financials", meta.get("use_financials", True)),
+    ]
+    for name, enabled in feats:
+        icon = "✅" if enabled else "❌"
+        st.write(f"  {icon} {name}")
+
+
 # ─── Train ────────────────────────────────────────────────────────────────────
 def _render_train_results(results: dict) -> None:
     ok = sum(1 for v in results.values() if v["status"] == "success")
@@ -835,7 +903,7 @@ def page_train() -> None:
     with col2:
         end_date = st.date_input("End Date", value=None, key="tr_end")
 
-    col3, col4, col5, col6 = st.columns(4)
+    col3, col4, col5, col6, col7 = st.columns(5)
     with col3:
         from stock_prediction.models.trainer import AVAILABLE_MODELS
         selected_models = st.multiselect(
@@ -848,10 +916,20 @@ def page_train() -> None:
         if len(selected_models) > 1:
             st.caption("Ensemble mode: models will be weighted by validation accuracy.")
     with col4:
-        use_news = st.checkbox("News features", value=True, key="tr_news")
+        _HORIZON_OPTIONS = [1, 3, 5, 7, 10]
+        horizon = st.selectbox(
+            "Prediction horizon",
+            options=_HORIZON_OPTIONS,
+            index=_HORIZON_OPTIONS.index(5),
+            key="tr_horizon",
+            format_func=lambda x: f"{x} day{'s' if x > 1 else ''}",
+            help="Trading days ahead the model predicts. Saved with the model.",
+        )
     with col5:
-        use_llm = st.checkbox("LLM features", value=True, key="tr_llm")
+        use_news = st.checkbox("News features", value=True, key="tr_news")
     with col6:
+        use_llm = st.checkbox("LLM features", value=True, key="tr_llm")
+    with col7:
         use_financials = st.checkbox(
             "Financial features", value=True, key="tr_fin",
             help="Quarterly P&L / balance sheet ratios + report aging features"
@@ -888,6 +966,7 @@ def page_train() -> None:
                 use_llm,
                 use_financials,
                 selected_models,
+                horizon,
                 progress,
             ),
             daemon=True,
@@ -917,13 +996,7 @@ def page_predict() -> None:
         placeholder="e.g. RELIANCE.NS,TCS.NS",
         key="pr_syms",
     )
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        use_news = st.checkbox("News features", value=True, key="pr_news")
-    with col2:
-        use_llm = st.checkbox("LLM features", value=True, key="pr_llm")
-    with col3:
-        use_fin_pr = st.checkbox("Financial features", value=True, key="pr_fin")
+    st.caption("Feature flags (News / LLM / Financials) and prediction horizon are loaded automatically from each symbol's trained model.")
 
     if st.button("▶ Run Predict", type="primary", key="pr_run"):
         symbol_list = _parse_symbols(symbols_input)
@@ -942,24 +1015,27 @@ def page_predict() -> None:
                 staleness = get_setting("models", "staleness_warning_days", default=30)
 
                 signals = []
+                signal_metas: dict[str, dict] = {}
                 warn_msgs: list[str] = []
 
                 for symbol in symbol_list:
                     try:
-                        sig, model_age, _ = _predict_for_symbol(
-                            symbol, trainer, signal_gen, use_news, use_llm, use_fin_pr
+                        sig, model_age, meta, _ = _predict_for_symbol(
+                            symbol, trainer, signal_gen
                         )
                         if model_age and model_age > staleness:
                             warn_msgs.append(
                                 f"{symbol}: model is {model_age} days old — consider retraining"
                             )
                         signals.append(sig)
+                        signal_metas[symbol] = meta
                     except FileNotFoundError:
                         warn_msgs.append(f"{symbol}: no trained model — run Train first")
                     except Exception as ex:
                         warn_msgs.append(f"{symbol}: {ex}")
 
                 st.session_state.predict_signals = signals
+                st.session_state.predict_signal_metas = signal_metas
                 st.session_state.predict_warnings = warn_msgs
 
             except Exception as e:
@@ -992,9 +1068,13 @@ def page_predict() -> None:
             )
 
     _section("Signal Table")
-    # Header
-    pr_cols = st.columns([1, 1, 1, 0.7, 0.7, 0.7, 0.6, 0.6, 2, 0.7])
-    for col, hdr in zip(pr_cols, ["Symbol", "Signal", "Confidence", "BUY %", "HOLD %", "SELL %", "RSI", "Short?", "Weekly Outlook", "Plots"]):
+    signal_metas = st.session_state.get("predict_signal_metas") or {}
+    # Header — 11 columns: …existing 10… + ℹ️
+    _PR_WIDTHS = [1, 1, 1, 0.7, 0.7, 0.7, 0.6, 0.6, 2, 0.5, 0.5]
+    _PR_HEADERS = ["Symbol", "Signal", "Confidence", "BUY %", "HOLD %", "SELL %",
+                   "RSI", "Short?", "Weekly Outlook", "📊", "ℹ️"]
+    pr_cols = st.columns(_PR_WIDTHS)
+    for col, hdr in zip(pr_cols, _PR_HEADERS):
         col.markdown(f"**{hdr}**")
     from pathlib import Path as _PPath
     _plot_base = _PPath("data/plots")
@@ -1005,7 +1085,7 @@ def page_predict() -> None:
         tr_path   = sym_plots / f"{sig.symbol}_train_plot.html"
         has_plots = pred_path.exists()
 
-        rcols = st.columns([1, 1, 1, 0.7, 0.7, 0.7, 0.6, 0.6, 2, 0.7])
+        rcols = st.columns(_PR_WIDTHS)
         rcols[0].write(sig.symbol)
         sig_css = {"STRONG BUY": "#166534", "BUY": "#16a34a", "HOLD": "#d97706",
                    "SELL": "#dc2626", "STRONG SELL": "#7f1d1d"}.get(sig.signal, "#6b7280")
@@ -1027,6 +1107,9 @@ def page_predict() -> None:
                 })
         else:
             rcols[9].write("—")
+        meta = signal_metas.get(sig.symbol, {})
+        if rcols[10].button("ℹ️", key=f"pr_info_{sig.symbol}", help="Model info"):
+            _show_model_info_popup(sig.symbol, meta)
 
 
 # ─── Analyze ──────────────────────────────────────────────────────────────────
@@ -1086,24 +1169,30 @@ def page_analyze() -> None:
                 trainer = ModelTrainer()
                 signal_gen = SignalGenerator()
                 staleness = get_setting("models", "staleness_warning_days", default=30)
-                # _predict_for_symbol returns the base signal; re-generate with LLM context
-                _, model_age, df = _predict_for_symbol(
-                    sym, trainer, signal_gen, use_news, use_llm, use_fin_an
+                # _predict_for_symbol handles feature flags/horizon from meta
+                _, model_age, meta_an, df = _predict_for_symbol(
+                    sym, trainer, signal_gen
                 )
                 if model_age and model_age > staleness:
                     st.warning(f"Model for {sym} is {model_age} days old — consider retraining.")
-                horizon_an = int(get_setting("features", "prediction_horizon", default=1))
+                horizon_an = meta_an.get("horizon", 5)
                 label_cols = {"return_1d", "return_5d", f"return_{horizon_an}d", "signal"}
-                feature_cols = [c for c in df.columns if c not in label_cols]
+                feature_names_an = meta_an.get("feature_names", [])
                 tech = {
                     c: float(df[c].iloc[-1])
                     for c in ["RSI", "MACD_Histogram", "Price_SMA50_Ratio"]
                     if c in df.columns
                 }
                 import numpy as np
-                ensemble, scaler, seq_scaler, _ = trainer.load_models(sym)
+                ensemble, scaler, seq_scaler, _, __ = trainer.load_models(sym)
                 seq_len = 60
-                features = df[feature_cols].values
+                if feature_names_an:
+                    avail = [c for c in feature_names_an if c in df.columns]
+                    features = df[avail].values if avail else df[
+                        [c for c in df.columns if c not in label_cols]
+                    ].values
+                else:
+                    features = df[[c for c in df.columns if c not in label_cols]].values
                 n_f = features.shape[1]
                 lss = seq_scaler.transform(features[-seq_len:].reshape(-1, n_f)).reshape(1, seq_len, n_f)
                 lts = scaler.transform(features[-1].reshape(1, -1))
