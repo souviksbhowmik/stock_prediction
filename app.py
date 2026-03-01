@@ -101,6 +101,13 @@ for _key in (
     if _key not in st.session_state:
         st.session_state[_key] = set() if _key == "watchlist" else None
 
+if "settings_cache" not in st.session_state:
+    st.session_state["settings_cache"] = {}
+
+# Apply session overrides so all downstream get_setting() calls pick them up.
+from stock_prediction.config import set_ui_overrides as _set_ui_overrides
+_set_ui_overrides(st.session_state.get("settings_cache", {}))
+
 # ─── Constants ───────────────────────────────────────────────────────────────
 SIGNAL_BG: dict[str, str] = {
     "STRONG BUY":  "#166534",
@@ -124,6 +131,7 @@ PAGES = [
     "💰 Trade",
     "💼 Portfolio",
     "📈 Gain Report",
+    "⚙️ Settings",
 ]
 
 # ─── Shared helpers ───────────────────────────────────────────────────────────
@@ -1509,6 +1517,93 @@ def page_gain_report() -> None:
         )
 
 
+# ─── Settings ─────────────────────────────────────────────────────────────────
+def page_settings() -> None:
+    from stock_prediction.config import get_setting, set_ui_overrides as _apply
+
+    st.title("⚙️ Session Settings")
+    st.info(
+        "Settings here apply to this browser session only. "
+        "Restart the app to reset. "
+        "Edit `config/settings.yaml` for permanent changes."
+    )
+
+    # ── Signal Thresholds ────────────────────────────────────────────────────
+    _section("Signal Thresholds")
+    st.markdown(
+        "These thresholds determine the minimum predicted return required to "
+        "generate a **BUY** or **SELL** signal for each forecast horizon. "
+        "Values are stored as decimals (e.g. 2.2% → 0.022)."
+    )
+
+    # Load current effective thresholds (session override or YAML default)
+    current_thresholds: dict = get_setting("signals", "horizon_thresholds") or {}
+
+    # Build editable inputs for horizons 1–10
+    horizons = list(range(1, 11))
+    buy_vals: dict[int, float] = {}
+    sell_vals: dict[int, float] = {}
+
+    header_cols = st.columns([1.5, 2, 2])
+    header_cols[0].markdown("**Horizon (days)**")
+    header_cols[1].markdown("**Buy threshold (%)**")
+    header_cols[2].markdown("**Sell threshold (%, shown as positive)**")
+
+    for h in horizons:
+        defaults = current_thresholds.get(h, [0.0, 0.0])
+        buy_default = float(defaults[0]) * 100 if defaults else 0.0
+        sell_default = abs(float(defaults[1])) * 100 if defaults else 0.0
+
+        row = st.columns([1.5, 2, 2])
+        row[0].markdown(f"**{h}d**")
+        buy_vals[h] = row[1].number_input(
+            label=f"Buy {h}d",
+            value=round(buy_default, 2),
+            min_value=0.0,
+            max_value=10.0,
+            step=0.1,
+            format="%.2f",
+            label_visibility="collapsed",
+            key=f"settings_buy_{h}",
+        )
+        sell_vals[h] = row[2].number_input(
+            label=f"Sell {h}d",
+            value=round(sell_default, 2),
+            min_value=0.0,
+            max_value=10.0,
+            step=0.1,
+            format="%.2f",
+            label_visibility="collapsed",
+            key=f"settings_sell_{h}",
+        )
+
+    col_apply, col_reset = st.columns([1, 1])
+
+    with col_apply:
+        if st.button("Apply to session", type="primary", key="settings_apply"):
+            new_thresholds = {
+                h: [round(buy_vals[h] / 100, 6), -round(sell_vals[h] / 100, 6)]
+                for h in horizons
+            }
+            cache = dict(st.session_state.get("settings_cache", {}))
+            cache.setdefault("signals", {})["horizon_thresholds"] = new_thresholds
+            st.session_state["settings_cache"] = cache
+            _apply(cache)
+            st.success("Thresholds applied for this session.")
+            st.rerun()
+
+    with col_reset:
+        if st.button("Reset to config defaults", key="settings_reset"):
+            cache = dict(st.session_state.get("settings_cache", {}))
+            cache.get("signals", {}).pop("horizon_thresholds", None)
+            if not cache.get("signals"):
+                cache.pop("signals", None)
+            st.session_state["settings_cache"] = cache
+            _apply(cache)
+            st.success("Reset to settings.yaml defaults.")
+            st.rerun()
+
+
 # ─── Router ───────────────────────────────────────────────────────────────────
 PAGE_MAP = {
     "📊 Suggest (deprecated)": page_suggest,
@@ -1522,6 +1617,7 @@ PAGE_MAP = {
     "💰 Trade":      page_trade,
     "💼 Portfolio":  page_portfolio,
     "📈 Gain Report": page_gain_report,
+    "⚙️ Settings":   page_settings,
 }
 
 PAGE_MAP[page]()

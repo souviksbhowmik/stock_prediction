@@ -8,6 +8,21 @@ import yaml
 
 _config_cache: dict[str, Any] = {}
 
+# UI session overrides — set by Streamlit app; always empty for CLI.
+_ui_overrides: dict[str, Any] = {}
+
+
+def set_ui_overrides(overrides: dict) -> None:
+    """Replace the UI override store. Called by Streamlit on every render."""
+    global _ui_overrides
+    _ui_overrides = overrides
+
+
+def clear_ui_overrides() -> None:
+    """Clear all UI overrides (reverts to settings.yaml)."""
+    global _ui_overrides
+    _ui_overrides = {}
+
 
 def _find_config_dir() -> Path:
     """Find the config directory relative to project root."""
@@ -57,6 +72,19 @@ def load_nifty50_config(config_path: str | Path | None = None) -> dict[str, Any]
 
 def get_setting(*keys: str, default: Any = None) -> Any:
     """Get a nested setting value. Example: get_setting('models', 'lstm', 'epochs')"""
+    # Check UI session overrides first (Streamlit only; always empty in CLI)
+    if _ui_overrides:
+        value = _ui_overrides
+        found = True
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                found = False
+                break
+        if found:
+            return value
+    # Fall back to settings.yaml
     settings = load_settings()
     value = settings
     for key in keys:
