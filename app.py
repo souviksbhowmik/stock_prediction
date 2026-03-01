@@ -1349,6 +1349,12 @@ def page_trade() -> None:
                 key="td_tid",
             )
 
+    comment_input = st.text_input(
+        "Comment (optional)",
+        placeholder="e.g. based on RSI signal, earnings play …",
+        key="td_comment",
+    )
+
     if st.button("▶ Execute Trade", type="primary", key="td_run"):
         if not symbol.strip():
             st.warning("Please enter a symbol.")
@@ -1360,8 +1366,10 @@ def page_trade() -> None:
                 from stock_prediction.signals.paper_trading import PaperTradingManager
                 manager = PaperTradingManager()
 
+                comment = comment_input.strip()
+
                 if action == "Buy (Long)":
-                    trade = manager.buy(sym, float(amount))
+                    trade = manager.buy(sym, float(amount), comment=comment)
                     if trade.status == "CLOSED":
                         st.success(f"Covered SHORT {sym} @ ₹{trade.exit_price:,.2f}")
                         st.metric("Realized PnL", f"₹{trade.pnl:+,.2f} ({trade.pnl_pct:+.1f}%)")
@@ -1383,7 +1391,7 @@ def page_trade() -> None:
                     st.metric("Realized PnL", f"₹{trade.pnl:+,.2f} ({trade.pnl_pct:+.1f}%)")
 
                 elif action == "Short Sell":
-                    trade = manager.short_sell(sym, float(amount))
+                    trade = manager.short_sell(sym, float(amount), comment=comment)
                     st.success(
                         f"SHORT {sym} — {trade.quantity:.4f} shares @ ₹{trade.entry_price:,.2f}"
                     )
@@ -1417,6 +1425,7 @@ def page_portfolio() -> None:
         st.info("No open positions. Open trades on the Trade page.")
         return
 
+    any_comment = any(getattr(t, "comment", "") for t in trades)
     rows = [
         {
             "Trade ID":         t.trade_id,
@@ -1429,6 +1438,7 @@ def page_portfolio() -> None:
             "Invested ₹":       f"{t.amount:,.0f}",
             "Unrealized PnL ₹": f"{t.pnl:+,.2f}" if t.pnl is not None else "—",
             "PnL %":            f"{t.pnl_pct:+.1f}%" if t.pnl_pct is not None else "—",
+            **( {"Comment": getattr(t, "comment", "") or "—"} if any_comment else {} ),
         }
         for t in trades
     ]

@@ -27,6 +27,7 @@ class PaperTrade:
     status: str = "OPEN"  # "OPEN" or "CLOSED"
     pnl: float | None = None
     pnl_pct: float | None = None
+    comment: str = ""  # optional user note; "" for legacy trades
 
 
 @dataclass
@@ -56,7 +57,7 @@ class PaperTradingManager:
             )
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def buy(self, symbol: str, amount: float) -> PaperTrade:
+    def buy(self, symbol: str, amount: float, comment: str = "") -> PaperTrade:
         """Open a LONG position or cover an existing SHORT."""
         trades = self._load_ledger()
 
@@ -79,6 +80,7 @@ class PaperTradingManager:
             entry_price=price,
             quantity=quantity,
             amount=amount,
+            comment=comment.strip(),
         )
 
         trades.append(trade)
@@ -125,7 +127,7 @@ class PaperTradingManager:
         logger.info(f"SELL {symbol}: {position.quantity:.4f} shares @ {price:.2f} (PnL: {position.pnl:+.2f})")
         return position
 
-    def short_sell(self, symbol: str, amount: float) -> PaperTrade:
+    def short_sell(self, symbol: str, amount: float, comment: str = "") -> PaperTrade:
         """Open a SHORT position."""
         price = self._get_current_price(symbol)
         quantity = amount / price
@@ -138,6 +140,7 @@ class PaperTradingManager:
             entry_price=price,
             quantity=quantity,
             amount=amount,
+            comment=comment.strip(),
         )
 
         trades = self._load_ledger()
