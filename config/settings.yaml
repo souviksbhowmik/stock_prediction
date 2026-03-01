@@ -75,6 +75,19 @@ models:
     batch_size: 32
     patience: 10
   prophet: {}  # no extra hyperparameters needed; tuning done via changepoint_prior_scale grid
+  qlearning:
+    # Features used to build the discrete state space.
+    # Must be present in the feature matrix produced by FeaturePipeline.
+    state_features: ["RSI", "MACD_Histogram", "BB_Width", "Volume_Ratio", "Price_Momentum_5d"]
+    n_bins: 3              # quantile buckets per state feature (3 bins → 3^5=243 states)
+    learning_rate: 0.1     # Q-learning α
+    discount_factor: 0.95  # future reward discount γ
+    epsilon_start: 1.0     # initial exploration rate
+    epsilon_end: 0.01      # minimum exploration rate
+    epsilon_decay: 0.995   # per-episode ε decay factor
+    n_episodes: 10         # passes over training time-series
+    transaction_cost: 0.001  # 0.1% per trade (open or close)
+    temperature: 0.5       # softmax temperature: lower = more peaked predictions
   tft:
     hidden_size: 128
     num_heads: 4           # must divide hidden_size evenly; auto-reduced to 1 if not
@@ -88,7 +101,7 @@ models:
     lstm_weight: 0.4
     xgboost_weight: 0.6
   selected_models: ["lstm"]  # list of models to train/use; multiple = ensemble
-                             # available: lstm, xgboost, encoder_decoder, prophet, tft
+                             # available: lstm, xgboost, encoder_decoder, prophet, tft, qlearning
   save_dir: data/models
   train_split: 0.8
   staleness_warning_days: 30

@@ -1,4 +1,4 @@
-"""Weighted ensemble of LSTM, XGBoost, Encoder-Decoder, Prophet, and TFT models."""
+"""Weighted ensemble of LSTM, XGBoost, Encoder-Decoder, Prophet, TFT, and Q-learning models."""
 
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ def _get_tft_type():
     from stock_prediction.models.tft_model import TFTPredictor
     return TFTPredictor
 
+def _get_ql_type():
+    from stock_prediction.models.qlearning_model import QLearningPredictor
+    return QLearningPredictor
+
 
 @dataclass
 class EnsemblePrediction:
@@ -48,10 +52,13 @@ class EnsemblePrediction:
     tft_probs: dict[str, float] = field(
         default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
     )
+    qlearning_probs: dict[str, float] = field(
+        default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
+    )
 
 
 class EnsembleModel:
-    """Weighted-average ensemble of up to five model types.
+    """Weighted-average ensemble of up to six model types.
 
     Supported models (any combination):
       - lstm           : LSTM sequence classifier
@@ -59,6 +66,7 @@ class EnsembleModel:
       - encoder_decoder: Encoder-Decoder LSTM regressor (ratios → probs via Gaussian CDF)
       - prophet        : Prophet time-series regressor (single forecast broadcast)
       - tft            : Temporal Fusion Transformer regressor (ratios → probs via Gaussian CDF)
+      - qlearning      : Tabular Q-learning agent (Q-values → softmax probs)
 
     At least one model must be provided.  The weights must sum to 1.0; the
     caller (ModelTrainer) derives them dynamically from validation balanced
@@ -72,16 +80,19 @@ class EnsembleModel:
         encoder_decoder=None,
         prophet=None,
         tft=None,
+        qlearning=None,
         lstm_weight: float | None = None,
         xgboost_weight: float | None = None,
         encoder_decoder_weight: float | None = None,
         prophet_weight: float | None = None,
         tft_weight: float | None = None,
+        qlearning_weight: float | None = None,
     ):
         if (lstm is None and xgboost is None and encoder_decoder is None
-                and prophet is None and tft is None):
+                and prophet is None and tft is None and qlearning is None):
             raise ValueError(
-                "At least one of lstm / xgboost / encoder_decoder / prophet / tft must be provided"
+                "At least one of lstm / xgboost / encoder_decoder / prophet / tft / qlearning "
+                "must be provided"
             )
 
         self.lstm = lstm
@@ -89,6 +100,7 @@ class EnsembleModel:
         self.encoder_decoder = encoder_decoder
         self.prophet = prophet
         self.tft = tft
+        self.qlearning = qlearning
 
         self.lstm_weight = lstm_weight if lstm_weight is not None else (
             get_setting("models", "ensemble", "lstm_weight", default=0.4)
@@ -99,6 +111,7 @@ class EnsembleModel:
         self.encoder_decoder_weight = encoder_decoder_weight if encoder_decoder_weight is not None else 0.0
         self.prophet_weight = prophet_weight if prophet_weight is not None else 0.0
         self.tft_weight = tft_weight if tft_weight is not None else 0.0
+        self.qlearning_weight = qlearning_weight if qlearning_weight is not None else 0.0
 
     def predict(
         self, X_seq: np.ndarray | None, X_tab: np.ndarray | None
@@ -130,6 +143,7 @@ class EnsembleModel:
         ed_probs      = zeros.copy()
         prophet_probs = zeros.copy()
         tft_probs     = zeros.copy()
+        ql_probs      = zeros.copy()
 
         if self.lstm is not None and X_seq is not None:
             lstm_probs = self.lstm.predict_proba(X_seq)
@@ -155,6 +169,12 @@ class EnsembleModel:
             tft_probs = self.tft.predict_proba(X_seq)
             weighted_sum += self.tft_weight * tft_probs
             total_weight += self.tft_weight
+
+        if self.qlearning is not None and X_seq is not None:
+            # Q-learning uses last timestep of the sequence for state lookup
+            ql_probs = self.qlearning.predict_proba(X_seq)
+            weighted_sum += self.qlearning_weight * ql_probs
+            total_weight += self.qlearning_weight
 
         ensemble_probs = weighted_sum / max(total_weight, 1e-8)
 
@@ -196,6 +216,11 @@ class EnsembleModel:
                         "SELL": float(tft_probs[i][0]),
                         "HOLD": float(tft_probs[i][1]),
                         "BUY":  float(tft_probs[i][2]),
+                    },
+                    qlearning_probs={
+                        "SELL": float(ql_probs[i][0]),
+                        "HOLD": float(ql_probs[i][1]),
+                        "BUY":  float(ql_probs[i][2]),
                     },
                 )
             )
