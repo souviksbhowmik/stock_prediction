@@ -641,5 +641,46 @@ def lookup(query: str):
     console.print(f"[dim]Saved: {lookup_path}[/dim]")
 
 
+@cli.command("model-info")
+@click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
+def model_info(symbol: str):
+    """Show production model details for a symbol."""
+    import joblib
+    from rich.table import Table
+    from rich.text import Text
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+    meta_path = save_dir / symbol.replace(".", "_") / "meta.joblib"
+
+    if not meta_path.exists():
+        console.print(f"[yellow]No trained model found for {symbol}.[/yellow]")
+        return
+
+    meta = joblib.load(meta_path)
+
+    sel       = meta.get("selected_models") or []
+    acc       = meta.get("val_accuracy")
+    trained   = (meta.get("trained_at") or "")[:16].replace("T", " ")
+    horizon   = meta.get("horizon", "—")
+    use_news  = meta.get("use_news", False)
+    use_llm   = meta.get("use_llm", False)
+    use_fin   = meta.get("use_financials", False)
+
+    table = Table(title=f"Production Model — {symbol}", show_header=False, box=None, padding=(0, 2))
+    table.add_column("Field", style="bold cyan", no_wrap=True)
+    table.add_column("Value")
+
+    table.add_row("Algorithms",    ", ".join(sel) if sel else "—")
+    table.add_row("Val Accuracy",  f"{acc:.1%}" if acc is not None else "—")
+    table.add_row("Trained At",    trained or "—")
+    table.add_row("Horizon",       f"{horizon} day{'s' if horizon != 1 else ''}")
+    table.add_row("News features", Text("✓", style="green") if use_news else Text("✗", style="red"))
+    table.add_row("LLM features",  Text("✓", style="green") if use_llm  else Text("✗", style="red"))
+    table.add_row("Financials",    Text("✓", style="green") if use_fin  else Text("✗", style="red"))
+    table.add_row("Model path",    str(meta_path.parent))
+
+    console.print(table)
+
+
 if __name__ == "__main__":
     cli()
