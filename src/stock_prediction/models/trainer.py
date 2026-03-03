@@ -87,6 +87,30 @@ _DQN_PARAM_GRID: list[dict] = [
 ]
 
 
+def list_experiments(symbol: str, save_dir: Path) -> list[dict]:
+    """Return metadata for all experimental runs for a symbol, newest first."""
+    exp_root = save_dir / symbol.replace(".", "_") / "experimental"
+    results: list[dict] = []
+    if not exp_root.exists():
+        return results
+    for run_dir in sorted(exp_root.iterdir(), reverse=True):
+        meta_path = run_dir / "meta.joblib"
+        if run_dir.is_dir() and meta_path.exists():
+            meta = joblib.load(meta_path)
+            results.append({"run_id": run_dir.name, "run_dir": run_dir, **meta})
+    return results
+
+
+def promote_experiment(symbol: str, run_dir: Path, save_dir: Path) -> None:
+    """Copy an experimental run's files to the production model directory."""
+    import shutil
+    prod_dir = save_dir / symbol.replace(".", "_")
+    prod_dir.mkdir(parents=True, exist_ok=True)
+    for src in run_dir.iterdir():
+        if src.is_file():
+            shutil.copy2(src, prod_dir / src.name)
+
+
 class ModelTrainer:
     """Train and persist prediction models for each stock."""
 
@@ -115,6 +139,7 @@ class ModelTrainer:
         start_date: str | None = None,
         end_date: str | None = None,
         selected_models: list[str] | None = None,
+        experiment_dir: Path | None = None,
     ) -> tuple[EnsembleModel | None, float | None, dict]:
         """Train models for a single stock.
 
@@ -623,10 +648,14 @@ class ModelTrainer:
             use_llm=self.use_llm,
             use_financials=self.use_financials,
             val_accuracy=val_accuracy,
+            save_dir_override=experiment_dir,
         )
 
         # ── 8. Generate time-series plots ────────────────────────────────
+        # Skip plot generation for experimental runs — keeps them fast.
         plot_paths: dict[str, str] = {}
+        if experiment_dir is not None:
+            return ensemble, val_accuracy, plot_paths
         try:
             ed_ratios_for_plot = None
             if ed_final is not None and seq_reg is not None:
@@ -1140,8 +1169,10 @@ class ModelTrainer:
         use_llm: bool = True,
         use_financials: bool = True,
         val_accuracy: float | None = None,
+        save_dir_override: Path | None = None,
     ) -> None:
-        model_dir = self.save_dir / symbol.replace(".", "_")
+        model_dir = save_dir_override if save_dir_override is not None \
+                    else (self.save_dir / symbol.replace(".", "_"))
         model_dir.mkdir(parents=True, exist_ok=True)
 
         if lstm    is not None: lstm.save(model_dir / "lstm.pt")

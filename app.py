@@ -125,6 +125,7 @@ PAGES = [
     "🔍 Lookup",
     "📥 Fetch Data",
     "🧠 Train",
+    "🧪 Experimental",
     "🔮 Predict",
     "🔬 Analyze",
     "📡 Screen",
@@ -420,6 +421,11 @@ with st.sidebar:
             f'⏳ Training {_done}/{_total}</div>',
             unsafe_allow_html=True,
         )
+    # Experimental training status badge
+    _ep = st.session_state.get("exp_progress")
+    if _ep and not _ep.get("complete"):
+        st.markdown("---")
+        st.caption(f"🧪 Exp {_ep.get('done', 0)}/{_ep.get('total', 1)} ({_ep.get('symbol', '')})")
     st.markdown("---")
     st.markdown("**Watchlist** — click a symbol to act on it")
     wl_sorted = sorted(st.session_state.watchlist)
@@ -1011,6 +1017,285 @@ def page_train() -> None:
         )
         thread.start()
         st.rerun()
+
+
+# ─── Experimental Training ────────────────────────────────────────────────────
+
+def _run_experimental_bg(
+    symbol: str,
+    algorithms: list[str],
+    sd: str | None,
+    ed: str | None,
+    use_news: bool,
+    use_llm: bool,
+    use_financials: bool,
+    horizon: int,
+    save_dir: Path,
+    progress: dict,
+) -> None:
+    """Background thread: trains each algorithm sequentially into its own run dir."""
+    try:
+        from datetime import datetime as _dt
+        from stock_prediction.models.trainer import ModelTrainer
+        from stock_prediction.config import load_settings
+        load_settings()["features"]["prediction_horizon"] = horizon
+        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
+        sym_key = symbol.replace(".", "_")
+        for alg in algorithms:
+            if progress.get("cancelled"):
+                break
+            progress["current_alg"] = alg
+            run_id = f"{_dt.now():%Y%m%d_%H%M%S}_{alg}"
+            run_dir = save_dir / sym_key / "experimental" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                model, accuracy, _ = trainer.train_stock(
+                    symbol, sd, ed, [alg], experiment_dir=run_dir
+                )
+                if model is None:
+                    progress["results"][alg] = {
+                        "status": "no_data", "val_accuracy": None, "run_dir": str(run_dir),
+                    }
+                else:
+                    progress["results"][alg] = {
+                        "status": "success", "val_accuracy": accuracy, "run_dir": str(run_dir),
+                    }
+            except Exception as e:
+                progress["results"][alg] = {
+                    "status": "failed", "val_accuracy": None, "run_dir": str(run_dir),
+                    "reason": str(e),
+                }
+            progress["done"] = progress["done"] + 1
+    except Exception as e:
+        progress["error"] = str(e)
+    finally:
+        progress["complete"] = True
+        progress["current_alg"] = None
+
+
+def page_experimental_train() -> None:
+    st.title("🧪 Experimental — Algorithm Sandbox")
+    st.caption(
+        "Train individual algorithms for a single symbol in an isolated sandbox. "
+        "Compare validation accuracies, then promote the best candidate to production. "
+        "Production models are never touched during experimental runs."
+    )
+
+    from stock_prediction.config import get_setting
+    from stock_prediction.models.trainer import AVAILABLE_MODELS, list_experiments, promote_experiment
+    import shutil
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+
+    ep = st.session_state.get("exp_progress")
+    exp_active = ep is not None and not ep.get("complete", False)
+
+    # ── Section 1: Setup form ─────────────────────────────────────────────────
+    _section("Setup")
+    symbol_input = st.text_input(
+        "Stock Symbol",
+        placeholder="e.g. INFY.NS",
+        key="exp_sym",
+        disabled=exp_active,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        algorithms = st.multiselect(
+            "Algorithms to test",
+            options=AVAILABLE_MODELS,
+            default=["lstm"],
+            key="exp_algs",
+            disabled=exp_active,
+        )
+    with col2:
+        _HORIZON_OPTIONS = [1, 3, 5, 7, 10]
+        horizon = st.selectbox(
+            "Prediction horizon",
+            options=_HORIZON_OPTIONS,
+            index=_HORIZON_OPTIONS.index(5),
+            key="exp_horizon",
+            format_func=lambda x: f"{x} day{'s' if x > 1 else ''}",
+            disabled=exp_active,
+        )
+
+    col3, col4 = st.columns(2)
+    with col3:
+        start_date = st.date_input("Start Date", value=None, key="exp_start", disabled=exp_active)
+    with col4:
+        end_date = st.date_input("End Date", value=None, key="exp_end", disabled=exp_active)
+
+    col5, col6, col7 = st.columns(3)
+    with col5:
+        use_news = st.checkbox("News features", value=True, key="exp_news", disabled=exp_active)
+    with col6:
+        use_llm = st.checkbox("LLM features", value=True, key="exp_llm", disabled=exp_active)
+    with col7:
+        use_financials = st.checkbox("Financial features", value=True, key="exp_fin", disabled=exp_active)
+
+    if not exp_active:
+        if st.button("▶ Start Experimental Training", type="primary", key="exp_run"):
+            sym = symbol_input.strip().upper()
+            if not sym:
+                st.warning("Please enter a stock symbol.")
+                st.stop()
+            if not algorithms:
+                st.warning("Please select at least one algorithm.")
+                st.stop()
+
+            progress: dict = {
+                "symbol":      sym,
+                "algorithms":  algorithms,
+                "total":       len(algorithms),
+                "done":        0,
+                "current_alg": None,
+                "results":     {},
+                "complete":    False,
+                "cancelled":   False,
+                "error":       None,
+            }
+            st.session_state["exp_progress"] = progress
+
+            thread = threading.Thread(
+                target=_run_experimental_bg,
+                args=(
+                    sym,
+                    algorithms,
+                    str(start_date) if start_date else None,
+                    str(end_date) if end_date else None,
+                    use_news,
+                    use_llm,
+                    use_financials,
+                    horizon,
+                    save_dir,
+                    progress,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            st.rerun()
+
+    # ── Section 2: Training progress ──────────────────────────────────────────
+    if ep is not None:
+        _section("Training Progress")
+        done  = ep.get("done", 0)
+        total = ep.get("total", 1)
+        current = ep.get("current_alg")
+        frac  = done / total if total else 0
+
+        if exp_active:
+            st.info("⏳ Experimental training running — safe to navigate away and return.")
+            st.progress(frac)
+            st.markdown(
+                f"**{done} / {total}** complete"
+                + (f" — training **{current}**" if current else "")
+            )
+            if ep.get("error"):
+                st.error(f"Error: {ep['error']}")
+
+        # Per-algorithm status rows
+        algorithms_in_progress = ep.get("algorithms", [])
+        results_so_far = ep.get("results", {})
+        for alg in algorithms_in_progress:
+            if alg in results_so_far:
+                r = results_so_far[alg]
+                if r["status"] == "success":
+                    acc_str = f"{r['val_accuracy']:.1%}" if r.get("val_accuracy") is not None else "—"
+                    st.markdown(f"- **{alg}** ✓  {acc_str}")
+                elif r["status"] == "no_data":
+                    st.markdown(f"- **{alg}** ⚠️  no data")
+                else:
+                    reason = r.get("reason", "")
+                    st.markdown(f"- **{alg}** ✗  failed — {reason}")
+            elif alg == current:
+                st.markdown(f"- **{alg}** ⏳ training…")
+            else:
+                st.markdown(f"- **{alg}** —")
+
+        col_cancel, _ = st.columns([1, 5])
+        with col_cancel:
+            if exp_active and st.button("⏹ Cancel", key="exp_cancel"):
+                ep["cancelled"] = True
+
+        if exp_active:
+            time.sleep(2)
+            st.rerun()
+
+    # ── Section 3: Experimental results table ─────────────────────────────────
+    sym_for_table = (ep.get("symbol") if ep else None) or symbol_input.strip().upper()
+    if sym_for_table:
+        experiments = list_experiments(sym_for_table, save_dir)
+        if experiments:
+            _section("Experimental Results")
+            for exp in experiments:
+                run_id   = exp["run_id"]
+                run_dir  = exp["run_dir"]
+                sel_models = exp.get("selected_models", [])
+                alg_label  = ", ".join(sel_models) if sel_models else run_id.split("_", 2)[-1]
+                acc        = exp.get("val_accuracy")
+                acc_str    = f"{acc:.1%}" if acc is not None else "—"
+                trained_at = exp.get("trained_at", "")[:16].replace("T", " ") if exp.get("trained_at") else "—"
+
+                col_id, col_alg, col_acc, col_at, col_act = st.columns([3, 2, 1.5, 2, 2])
+                col_id.code(run_id, language=None)
+                col_alg.write(alg_label)
+                col_acc.write(acc_str)
+                col_at.write(trained_at)
+
+                with col_act:
+                    promote_key = f"exp_promote_{run_id}"
+                    delete_key  = f"exp_delete_{run_id}"
+                    confirm_key = f"exp_confirm_{run_id}"
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("Promote", key=promote_key, use_container_width=True):
+                            st.session_state[confirm_key] = True
+                    with c2:
+                        if st.button("🗑", key=delete_key, use_container_width=True):
+                            import shutil as _shutil
+                            _shutil.rmtree(run_dir, ignore_errors=True)
+                            st.toast(f"Deleted {run_id}", icon="🗑")
+                            st.rerun()
+
+                if st.session_state.get(confirm_key):
+                    st.warning(
+                        f"Promote **{run_id}** to production? This overwrites existing production files for {sym_for_table}."
+                    )
+                    c_yes, c_no, _ = st.columns([1, 1, 5])
+                    with c_yes:
+                        if st.button("✅ Confirm", key=f"exp_confirm_yes_{run_id}"):
+                            promote_experiment(sym_for_table, run_dir, save_dir)
+                            st.session_state.pop(confirm_key, None)
+                            st.toast(f"Promoted {run_id} to production!", icon="✅")
+                            st.rerun()
+                    with c_no:
+                        if st.button("✗ Cancel", key=f"exp_confirm_no_{run_id}"):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+
+    # ── Section 4: Current production model ───────────────────────────────────
+    sym_for_prod = (ep.get("symbol") if ep else None) or symbol_input.strip().upper()
+    if sym_for_prod:
+        with st.expander(f"Current Production Model for {sym_for_prod}", expanded=False):
+            prod_meta_path = save_dir / sym_for_prod.replace(".", "_") / "meta.joblib"
+            if prod_meta_path.exists():
+                import joblib as _joblib
+                prod_meta = _joblib.load(prod_meta_path)
+                sel = prod_meta.get("selected_models") or []
+                acc = prod_meta.get("val_accuracy")
+                trained_at = (prod_meta.get("trained_at") or "")[:16].replace("T", " ")
+                hor = prod_meta.get("horizon", "—")
+                news_flag = "✓" if prod_meta.get("use_news") else "✗"
+                llm_flag  = "✓" if prod_meta.get("use_llm")  else "✗"
+                fin_flag  = "✓" if prod_meta.get("use_financials") else "✗"
+                st.markdown(f"**Algorithms** : {', '.join(sel) if sel else '—'}")
+                st.markdown(f"**Val Accuracy**: {f'{acc:.1%}' if acc is not None else '—'}")
+                st.markdown(f"**Trained At** : {trained_at or '—'}")
+                st.markdown(f"**Horizon**    : {hor} day{'s' if hor != 1 else ''}")
+                st.markdown(f"**Features**   : News {news_flag}   LLM {llm_flag}   Financials {fin_flag}")
+            else:
+                st.info(f"No production model trained yet for {sym_for_prod}.")
 
 
 # ─── Predict ──────────────────────────────────────────────────────────────────
@@ -1698,6 +1983,7 @@ PAGE_MAP = {
     "🔍 Lookup":     page_lookup,
     "📥 Fetch Data": page_fetch_data,
     "🧠 Train":      page_train,
+    "🧪 Experimental": page_experimental_train,
     "🔮 Predict":    page_predict,
     "🔬 Analyze":    page_analyze,
     "📡 Screen":     page_screen,
