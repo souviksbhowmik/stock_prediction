@@ -380,11 +380,14 @@ def _predict_for_symbol(symbol, trainer, signal_gen):
         _lag_feat   = meta.get("lag_feature_names", [])
         if _lag_scaler is not None and _lag_feat:
             from stock_prediction.features.technical import add_lag_trend_features
-            _lag_df = add_lag_trend_features(df).dropna()
-            if not _lag_df.empty:
-                _avail = [c for c in _lag_feat if c in _lag_df.columns]
-                if _avail:
-                    _row = _lag_df[_avail].values[-1]
+            _lag_df = add_lag_trend_features(df)
+            # Select feature columns first so label-NaN rows (last `horizon` rows)
+            # are not dropped — only early rolling-window NaN rows are removed.
+            _avail = [c for c in _lag_feat if c in _lag_df.columns]
+            if _avail:
+                _feat_df = _lag_df[_avail].dropna()
+                if not _feat_df.empty:
+                    _row = _feat_df.values[-1]
                     x_tab_lag = _lag_scaler.transform(_row.reshape(1, -1)).astype(np.float32)
 
     pred = ensemble.predict_single(
@@ -1238,11 +1241,12 @@ def page_analyze() -> None:
                     _lf = meta_an.get("lag_feature_names", [])
                     if _ls is not None and _lf:
                         from stock_prediction.features.technical import add_lag_trend_features
-                        _ld = add_lag_trend_features(df).dropna()
-                        if not _ld.empty:
-                            _av = [c for c in _lf if c in _ld.columns]
-                            if _av:
-                                x_tab_lag_an = _ls.transform(_ld[_av].values[-1].reshape(1, -1)).astype(np.float32)
+                        _ld = add_lag_trend_features(df)
+                        _av = [c for c in _lf if c in _ld.columns]
+                        if _av:
+                            _feat_ld = _ld[_av].dropna()
+                            if not _feat_ld.empty:
+                                x_tab_lag_an = _ls.transform(_feat_ld.values[-1].reshape(1, -1)).astype(np.float32)
 
                 pred = ensemble.predict_single(
                     lss.astype(np.float32), lts.astype(np.float32), X_tab_lag=x_tab_lag_an

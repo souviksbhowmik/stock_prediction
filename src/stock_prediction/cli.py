@@ -26,13 +26,17 @@ def _build_x_tab_lag(df, meta):
     try:
         from stock_prediction.features.technical import add_lag_trend_features
         import numpy as np
-        lag_df = add_lag_trend_features(df).dropna()
-        if lag_df.empty:
-            return None
+        lag_df = add_lag_trend_features(df)
+        # Select feature columns BEFORE dropna so that rows with NaN labels
+        # (last `horizon` rows, whose future returns are unknown) are NOT dropped.
+        # Only early rows whose rolling-window features are still NaN get removed.
         available = [c for c in lag_feature_names if c in lag_df.columns]
         if not available:
             return None
-        latest_lag = lag_df[available].values[-1]
+        feat_df = lag_df[available].dropna()
+        if feat_df.empty:
+            return None
+        latest_lag = feat_df.values[-1]
         return lag_scaler.transform(latest_lag.reshape(1, -1)).astype(np.float32)
     except Exception:
         return None
