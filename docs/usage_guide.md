@@ -14,6 +14,12 @@ conda activate stock_prediction
 shortlist → fetch-data → train → predict → analyze → paper trade
 ```
 
+**Experimental / algorithm comparison workflow:**
+
+```
+experiment → list-experiments → promote → model-info → predict
+```
+
 > **Note:** `fetch-data` is a data preview step only — it does not save data to disk.
 > `train` fetches data live from yfinance independently. See each step below for details.
 
@@ -176,6 +182,99 @@ stockpredict train -s RELIANCE.NS -h 10                  # 10-day horizon
 stockpredict train -s RELIANCE.NS --no-news --no-llm     # Technical + financials only (faster)
 stockpredict train -s RELIANCE.NS --no-financials        # No quarterly financial features
 stockpredict train -s RELIANCE.NS --start-date 2023-01-01 --end-date 2024-12-31
+```
+
+---
+
+## Step 3b: Experimental Training (Algorithm Sandbox)
+
+Use this workflow to compare algorithms in isolation before committing one to production. The production model is never touched — each algorithm trains into its own timestamped subdirectory under `data/models/{SYMBOL}/experimental/`.
+
+### `experiment` — Train Algorithms in Isolation
+
+**What it does:**
+Trains each specified algorithm independently for a single symbol. Each algorithm gets its own run directory (`data/models/{SYMBOL}/experimental/YYYYMMDD_HHMMSS_{alg}/`) containing its model file and a `meta.joblib` with the same schema as production. Plots are skipped to keep experimental runs fast. All models are retrained on the **full dataset** (same as `train`) — the validation split is used only for scoring.
+
+**Dependencies:** Same as `train` — fetches its own data from yfinance.
+
+**Output:**
+- Console: Per-algorithm progress and val accuracy summary table
+- Files per algorithm: `data/models/{SYMBOL}/experimental/YYYYMMDD_HHMMSS_{alg}/` — model file + `meta.joblib`
+
+```bash
+stockpredict experiment -s INFY.NS -m lstm,encoder_decoder,prophet
+stockpredict experiment -s INFY.NS -m prophet --horizon 10
+stockpredict experiment -s INFY.NS -m lstm,xgboost --no-news --no-llm
+stockpredict experiment -s INFY.NS -m tft --start-date 2023-01-01
+```
+
+---
+
+### `list-experiments` — Compare Experimental Runs
+
+**What it does:**
+Lists all experimental runs saved for a symbol, newest first. Shows the algorithm, val accuracy, trained-at timestamp, and horizon for each run — helping you pick the best candidate to promote.
+
+**Dependencies:** At least one `experiment` run must exist for the symbol.
+
+**Output:**
+- Console: Rich table of all runs — Run ID, Algorithm, Val Accuracy, Trained At, Horizon
+
+```bash
+stockpredict list-experiments -s INFY.NS
+```
+
+---
+
+### `promote` — Promote a Run to Production
+
+**What it does:**
+Copies all files from an experimental run directory to the production model directory (`data/models/{SYMBOL}/`). After promotion, all prediction commands (`predict`, `analyze`, `lookup`) immediately use the promoted model — no restart required. Asks for confirmation before overwriting.
+
+**Dependencies:** The run ID must exist under `data/models/{SYMBOL}/experimental/` — use `list-experiments` to find it.
+
+**Output:**
+- Console: Confirmation of promotion
+- Files: `data/models/{SYMBOL}/meta.joblib` and model file overwritten with the experimental run's versions
+
+```bash
+stockpredict promote -s INFY.NS --run-id 20260303_143055_encoder_decoder
+stockpredict promote -s INFY.NS -r 20260303_143055_encoder_decoder --yes  # skip confirmation
+```
+
+---
+
+### `delete-experiment` — Remove an Experimental Run
+
+**What it does:**
+Deletes an experimental run directory and all its files. Asks for confirmation before deleting.
+
+**Dependencies:** The run ID must exist under `data/models/{SYMBOL}/experimental/`.
+
+**Output:**
+- Console: Deletion confirmation
+- Files: Run directory removed from disk
+
+```bash
+stockpredict delete-experiment -s INFY.NS --run-id 20260303_143022_lstm
+stockpredict delete-experiment -s INFY.NS -r 20260303_143022_lstm --yes   # skip confirmation
+```
+
+---
+
+### `model-info` — Show Production Model Details
+
+**What it does:**
+Reads `meta.joblib` from the production model directory and prints a summary: algorithms, val accuracy, trained-at timestamp, horizon, and which feature flags (news, LLM, financials) were active at training time. Useful for verifying what is currently in production before or after a promotion.
+
+**Dependencies:** A trained model must exist for the symbol (from `train` or `promote`).
+
+**Output:**
+- Console: Rich table — Algorithms, Val Accuracy, Trained At, Horizon, News/LLM/Financials flags, Model path
+
+```bash
+stockpredict model-info -s INFY.NS
+stockpredict model-info -s RELIANCE.NS
 ```
 
 ---
@@ -430,6 +529,7 @@ The UI mirrors all CLI functionality with additional visualisation. Key pages:
 | Page | Description |
 |------|-------------|
 | **Train** | Select symbols, model types, horizon (1/3/5/7/10 days), and feature flags (News, LLM, Financials). Runs training in the background and streams progress. |
+| **Experimental** | Algorithm sandbox for a single symbol. Train algorithms in isolation, compare val accuracies, promote the best to production, or delete runs — all without touching the production model. Shows a sidebar badge while experimental training is running. |
 | **Predict** | Run predictions for trained symbols. Feature flags and horizon are loaded automatically from the model — no user input needed. Each row has an **ℹ️** button showing model metadata (trained date, horizon, val accuracy, models used, feature flags). Each row also has a **📊** button to view the interactive training plots. |
 | **Analyze** | Deep-dive analysis for a single stock with LLM broker scores and chart. |
 | **Suggest** | Screener-style ranked watchlist without requiring trained models. |
@@ -447,8 +547,13 @@ The UI mirrors all CLI functionality with additional visualisation. Key pages:
 | 1 | `suggest` | Nothing |
 | 2 | `fetch-data` | Nothing (preview only — output not used by any other step) |
 | 3 | `train` | Nothing (fetches its own data from yfinance) |
-| 4 | `predict` | `train` — model files must exist in `data/models/` |
-| 5 | `analyze` | `train` — model file must exist for the specific symbol |
+| 3b | `experiment` | Nothing (fetches its own data from yfinance) |
+| 3b | `list-experiments` | At least one `experiment` run for the symbol |
+| 3b | `promote` | `experiment` — run ID must exist under `experimental/` |
+| 3b | `delete-experiment` | `experiment` — run ID must exist under `experimental/` |
+| 3b | `model-info` | `train` or `promote` — production model must exist |
+| 4 | `predict` | `train` or `promote` — model files must exist in `data/models/` |
+| 5 | `analyze` | `train` or `promote` — model file must exist for the specific symbol |
 | 6 | `screen` | Nothing |
 | 6b | `lookup` | Nothing for matching; trained models in `data/models/` for signal generation |
 | 7a | `test-buy` | Nothing (uses live price from yfinance) |
@@ -467,6 +572,11 @@ The UI mirrors all CLI functionality with additional visualisation. Key pages:
 | `suggest` | Ranked stocks table | `suggestions.csv` | — |
 | `fetch-data` | Per-symbol row counts | — | — |
 | `train` | Training progress + val accuracy | `train_summary.csv` | `data/models/{SYMBOL}/lstm.pt`, `xgboost.joblib`, `encoder_decoder.pt`, `prophet.joblib`, `meta.joblib`; `data/plots/{SYMBOL}/train_plot.html`, `val_plot.html`, `pred_plot.html` |
+| `experiment` | Per-algorithm progress + summary table | — | `data/models/{SYMBOL}/experimental/YYYYMMDD_HHMMSS_{alg}/` — model file + `meta.joblib` per algorithm |
+| `list-experiments` | Table of all experimental runs | — | — |
+| `promote` | Promotion confirmation | — | `data/models/{SYMBOL}/meta.joblib` and model file overwritten |
+| `delete-experiment` | Deletion confirmation | — | Run directory removed |
+| `model-info` | Production model summary table | — | — |
 | `predict` | 5 signal tables | `signals.csv`, `short_candidates.csv`, `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv` | `data/processed/predictions_YYYY-MM-DD.csv/json` (with `--export`) |
 | `screen` | 4 screener tables | `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv`, `signals.csv`, `short_candidates.csv` | — |
 | `lookup` | Matched stocks with signals | `lookup.csv` | — |
