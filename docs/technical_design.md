@@ -350,68 +350,347 @@ Dense(64 → 3)  →  Softmax  →  [P(SELL), P(HOLD), P(BUY)]
 
 **File:** `src/stock_prediction/models/encoder_decoder_model.py`
 
-Sequence-to-sequence LSTM that predicts a vector of `horizon` future price ratios (regression targets: `close[t+k] / close[t]`). Probability conversion via a Gaussian CDF model fitted to validation residuals.
+Sequence-to-sequence LSTM regressor. Predicts a vector of `horizon` future
+price ratios rather than a direct class label, then converts those ratios to
+BUY / HOLD / SELL probabilities using a Gaussian CDF model.
 
-| Component | Detail |
+**Architecture:**
+```
+Input: (batch, seq_len=60, n_features)
+  ↓
+Encoder LSTM (hidden_size, num_layers, dropout)
+  → (h_n, c_n)  [final hidden and cell state]
+  ↓
+Decoder LSTM — one step per forecast horizon
+  input at step k: [last_encoder_output | prev_pred_ratio]  (teacher-forcing during training)
+  → outputs ratio_k = close[t+k] / close[t]
+  ↓
+Output: (batch, horizon)  price ratios
+```
+
+**Regression → probability conversion:**
+
+1. Compute per-step residuals on the validation set:
+   `residual_k = predicted_ratio_k − true_ratio_k`
+2. Fit a single Gaussian: `μ=0`, `σ = std(all residuals across steps)`
+3. At inference, for horizon step `k`, compute:
+   - `P(BUY)  = 1 − Φ((buy_threshold  − predicted_ratio_k) / σ)`
+   - `P(SELL) = Φ((sell_threshold − predicted_ratio_k) / σ)`
+   - `P(HOLD) = 1 − P(BUY) − P(SELL)`
+   where `Φ` is the standard normal CDF and thresholds come from
+   `signals.horizon_thresholds[horizon]`.
+4. Softmax-normalise the three values so they sum to 1.0.
+
+| Property | Value |
 |---|---|
-| Encoder | LSTM `(seq_len, n_features) → hidden` |
-| Decoder | LSTM with optional teacher forcing; outputs `(horizon,)` ratios |
 | Loss | MSE on price ratios |
-| Tuning metric | MAPE (lower = better) |
-| Probability | Gaussian CDF over per-step thresholds; softmax-normalised to (SELL, HOLD, BUY) |
+| Tuning metric | MAPE on validation set (lower → better) |
+| Teacher forcing ratio | 0.5 during tuning, 0.3 during full retrain |
+| Saves as | `.pt` (PyTorch state_dict + residual_std + horizon) |
+
+---
 
 ### Temporal Fusion Transformer (TFT)
 
 **File:** `src/stock_prediction/models/tft_model.py`
 
-Pure-PyTorch implementation using the same regression→signal pipeline as the Encoder-Decoder. Same input/output interface; same MAPE-based tuning.
+Pure-PyTorch implementation of a simplified TFT using gated residual networks,
+variable selection, LSTM temporal encoding, and multi-head self-attention.
+Uses the same regression → Gaussian CDF probability pipeline as the
+Encoder-Decoder, so output probabilities are directly comparable.
 
-| Component | Detail |
+**Building blocks:**
+
+#### GatedResidualNetwork (GRN)
+
+```
+x  ──► Linear(d→d) ──► ELU ──► Linear(d→d) ──► GLU gate
+x  ──────────────────────────────────────────► skip (Linear if dim mismatch)
+                                                  ↓
+                                             LayerNorm(gate + skip)
+```
+
+The GLU (Gated Linear Unit) gate applies sigmoid to half the channels and
+multiplies element-wise with the other half, giving the network a soft
+content-selection mechanism. The skip connection with LayerNorm stabilises
+training in deeper configurations.
+
+#### VariableSelectionNetwork (VSN)
+
+```
+Input: (batch, seq_len, n_features)  — each feature is a scalar
+  ↓  for each feature j:
+  GRN_j(x[:,j])                         → (batch, seq_len, hidden_size)
+  ↓  all features stacked:
+  GRN_attn(flatten(x))                  → (batch, seq_len, n_features)
+  softmax(·) over feature axis           → attention weights ω_j
+  ↓
+  weighted_sum(ω_j * GRN_j outputs)     → (batch, seq_len, hidden_size)
+```
+
+Attention weights ω indicate which features the model relies on at each
+timestep. They are inspectable post-training for feature importance analysis.
+
+#### Full TFT forward pass
+
+```
+Input: (batch, seq_len, n_features)
+  ↓
+VariableSelectionNetwork               → (batch, seq_len, hidden_size)
+  ↓
+LSTM encoder (num_lstm_layers)         → (batch, seq_len, hidden_size)
+  ↓
+Multi-head Self-Attention
+  Q = K = V = LSTM output
+  num_heads, head_dim = hidden_size // num_heads
+  → (batch, seq_len, hidden_size)
+  ↓
+GatedResidualNetwork (post-attention)  → (batch, seq_len, hidden_size)
+  ↓
+Mean-pool over seq_len                 → (batch, hidden_size)
+  ↓
+Linear(hidden_size → horizon)          → (batch, horizon)  price ratios
+```
+
+`num_heads` is auto-reduced to 1 if `hidden_size % num_heads ≠ 0`.
+
+| Property | Value |
 |---|---|
-| `GatedResidualNetwork` | `Linear → ELU → Linear → GLU gating → LayerNorm + skip` |
-| `VariableSelectionNetwork` | Per-feature GRN + softmax attention weights |
-| `TemporalFusionTransformer` | VSN → LSTM encoder → Multi-head Self-Attention → GRN → Linear `(B, horizon)` |
 | Loss | MSE on price ratios |
-| `num_heads` | Auto-reduced to 1 if `hidden_size % num_heads != 0` |
+| Tuning metric | MAPE (same as Encoder-Decoder) |
+| Probability | Gaussian CDF → softmax (same pipeline as Encoder-Decoder) |
+| Saves as | `.pt` (PyTorch state_dict + residual_std + horizon) |
+
+---
+
+### Reinforcement Learning — Shared Reward Function
+
+Both Q-learning and DQN use the **position-based differential P&L reward**
+from Moody & Saffell (2001) and Spooner et al. (2018). The agent manages a
+binary position: `1 = LONG`, `0 = FLAT`.
+
+#### Formal definition
+
+```
+reward(t) = new_position(t) × r(t)  −  |Δposition(t)| × tc
+```
+
+| Symbol | Definition |
+|---|---|
+| `new_position(t)` | Position *after* applying action `a(t)`: 1 (LONG) or 0 (FLAT) |
+| `r(t)` | 1-step return at bar `t` = `close[t+1] / close[t] − 1` |
+| `Δposition(t)` | `\|new_position(t) − old_position(t)\|` ∈ {0, 1} — 1 when a trade is opened or closed |
+| `tc` | Transaction cost fraction (default 0.001 = 0.1% per trade side) |
+
+#### Case-by-case breakdown
+
+| Action | Prior position | new\_position | Δposition | Reward formula | Economic meaning |
+|--------|---------------|--------------|-----------|----------------|-----------------|
+| **BUY** | FLAT (0) | 1 | 1 | `r(t) − tc` | Open a long position; earn return for the bar; pay entry cost |
+| **BUY** | LONG (1) | 1 | 0 | `r(t)` | Already long; no trade, no cost; earn the bar's return |
+| **SELL** | LONG (1) | 0 | 1 | `0 − tc = −tc` | Close long position; pay exit cost; return for bar goes to seller |
+| **SELL** | FLAT (0) | 0 | 0 | `0` | Already flat; no trade, no cost, no P&L |
+| **HOLD** | LONG (1) | 1 | 0 | `r(t)` | Keep position; earn unrealised gain/loss |
+| **HOLD** | FLAT (0) | 0 | 0 | `0` | Stay flat; zero exposure, zero cost |
+
+#### Design properties
+
+- **P&L accumulation** — the agent earns `r(t)` for every bar it holds a long
+  position, matching real equity-curve accounting.
+- **Cost on transition only** — `tc` is charged exactly once when opening
+  (`FLAT → LONG`) or closing (`LONG → FLAT`); repeated same-direction actions
+  incur no extra cost, which discourages churning.
+- **No short selling** — the agent cannot go below `position = 0`; a SELL
+  action from a flat position is a no-op (`reward = 0`).
+- **Horizon mismatch by design** — the reward is 1-step P&L, not the
+  horizon-based label used to evaluate classification accuracy. The agent is
+  optimised as a trading policy, and accuracy against horizon labels is an
+  *external* evaluation metric reported separately.
+
+#### Label source for reward
+
+`r(t)` is taken from the first column of `reg_targets` produced by
+`prepare_regression_data`:
+
+```python
+returns_1d = reg_targets[:, 0] - 1.0   # close[t+1]/close[t] − 1
+```
+
+This is the *same* data used by the Encoder-Decoder and TFT for regression
+targets, so no additional data pipeline is needed for the RL agents.
+
+---
 
 ### Tabular Q-Learning
 
 **File:** `src/stock_prediction/models/qlearning_model.py`
 
-Reinforcement learning agent. Actions: 0=SELL, 1=HOLD, 2=BUY. State space is discretised from a configurable subset of the feature vector using quantile bins fitted on training data.
+Tabular reinforcement learning agent. The Q-function is stored as an explicit
+dictionary mapping discrete state tuples to Q-value arrays. No neural
+network is involved.
 
-**Reward function** (Moody & Saffell 2001):
-```
-reward(t) = new_position(t) × r(t) − |Δposition| × tc
-```
-where `r(t)` is the 1-step return and `tc` is transaction cost (0.1%).
+#### State space design
 
-| Component | Detail |
+```
+Configured state features (default):
+  RSI, MACD_Histogram, BB_Width, Volume_Ratio, Price_Momentum_5d
+
+For each feature f:
+  1. Fit n_bins quantile edges on the training column  (n_bins = 3 → 4 edges)
+  2. At inference: bin_idx = searchsorted(inner_edges, feature_value)
+                             ∈ {0, 1, ..., n_bins−1}
+
+State = tuple(bin_idx_1, bin_idx_2, ..., bin_idx_k)
+```
+
+With 5 features and 3 bins each: **3^5 = 243 possible states**.
+Unseen states at inference receive a HOLD-biased prior
+`Q = [0.0, 0.01, 0.0]` (SELL / HOLD / BUY), so the agent defaults to doing
+nothing rather than random trading when it encounters an unknown market regime.
+
+#### Q-learning update rule
+
+```
+Q(s, a) ← Q(s, a) + α × [r + γ × max_{a'} Q(s', a') − Q(s, a)]
+```
+
+| Symbol | Meaning | Default |
+|--------|---------|---------|
+| `α` (learning_rate) | Step size; how much each new experience overrides the old estimate | 0.1 |
+| `γ` (discount_factor) | Importance of future rewards vs immediate reward | 0.95 |
+| `r` | Reward from the shared reward function | — |
+| `max_{a'} Q(s', a')` | Best Q-value in next state (greedy target) | — |
+
+#### Exploration schedule
+
+```
+ε_episode = max(ε_end, ε_start × ε_decay^episode)
+```
+
+Epsilon decays per episode (not per step), so the agent explores the full
+time-series multiple times at each exploration level before reducing ε.
+Default: ε_start=1.0, ε_decay=0.995, ε_end=0.01.
+
+#### Probability output
+
+```
+Q_values = Q_table.get(state, UNSEEN_PRIOR)          # shape (3,)
+proba = softmax(Q_values / temperature)               # shape (3,)
+```
+
+Lower temperature → more peaked distribution (more decisive signals).
+Higher temperature → flatter distribution (more uncertainty).
+
+#### Input
+
+Uses the **last timestep** of the scaled sequence window:
+`X_seq[:, -1, :]` (shape `(N, n_features)`) — the most recent bar's
+feature vector, which represents the agent's current observation of the market.
+
+| Property | Value |
 |---|---|
-| State | Tuple of quantile-bin indices over state features |
-| Q-table | `dict[state_tuple, np.ndarray(3)]` — lazily initialised with HOLD-biased prior |
-| Update | `Q(s,a) ← Q(s,a) + α[r + γ max_a' Q(s',a') − Q(s,a)]` |
-| Exploration | ε-greedy; ε decays per episode |
-| Output | Softmax over Q-values with configurable temperature |
-| Input | Last timestep of the sequence window `X_seq[:, -1, :]` |
+| Saves as | `.joblib` (Q-table dict + bin edges + state feature indices + hyperparams) |
+| Tuning grid | 5 configs varying n_bins ∈ {3,4,5}, α ∈ {0.05,0.10}, n_episodes ∈ {10,20} |
+
+---
 
 ### Deep Q-Network (DQN)
 
 **File:** `src/stock_prediction/models/dqn_model.py`
 
-Neural Q-learning agent. Same reward function as tabular Q-learning. Three improvements over the tabular model:
-- **Neural Q-function** — continuous state; MLP generalises to unseen feature combinations without discretisation.
-- **Experience replay buffer** — circular deque; random mini-batch sampling breaks temporal correlations.
-- **Target network** — periodically frozen copy supplies stable Bellman targets, reducing the moving-target problem.
+Neural reinforcement learning agent. Uses the **same reward function** as
+tabular Q-learning but replaces the discrete Q-table with a continuous neural
+Q-function, adding experience replay and a target network for training
+stability.
 
-| Component | Detail |
+#### Comparison with tabular Q-learning
+
+| Property | Tabular Q-Learning | Deep Q-Network |
+|---|---|---|
+| State representation | Discretised bins | Raw continuous features |
+| Q-function | Lookup table | MLP neural network |
+| Generalisation | None (unseen states use prior) | Interpolates via learned weights |
+| Update | Single-sample TD | Mini-batch from replay buffer |
+| Training stability | Inherently stable (table lookup) | Target network + gradient clipping |
+| State space | 3^5 = 243 cells (default) | Continuous ℝ^n |
+
+#### Network architecture
+
+```
+_QNetwork (MLP):
+
+Input: (batch, n_features)   — continuous scaled feature vector
+  ↓
+[Linear(n_features → h_i) → ReLU → Dropout(p)]  ×  len(hidden_sizes)
+  ↓
+Linear(h_last → 3)           — one Q-value per action (SELL / HOLD / BUY)
+
+Output: (batch, 3)           — unnormalised Q-values
+```
+
+Default `hidden_sizes = [256, 128]` gives a two-hidden-layer network with
+256 → 128 → 3 units. Adding entries (e.g. `[256, 128, 64]`) creates a
+deeper network.
+
+#### Experience replay buffer
+
+```
+_ReplayBuffer (circular deque, capacity = buffer_size):
+
+  push(state, action, reward, next_state, done)   → appends; oldest evicted when full
+  sample(batch_size)                               → random minibatch of transitions
+```
+
+Random sampling breaks the temporal autocorrelation of consecutive market
+bars, which would otherwise bias gradient updates toward recent market
+conditions. The buffer accumulates all transitions from all episodes.
+
+#### Bellman update
+
+```
+For each minibatch transition (s, a, r, s', done):
+
+  q_pred   = Q_online(s)[a]                               current Q-value for taken action
+  q_next   = max_a' Q_target(s')                          best next Q-value (from frozen target net)
+  q_target = r + γ × q_next × (1 − done)                 Bellman target
+
+  loss = Huber(q_pred, q_target)                          smooth-L1; robust to reward outliers
+  ∇ backprop through Q_online only
+  clip gradients: max_norm = 10.0
+```
+
+`Q_target` is a **frozen copy** of `Q_online` synced every `target_update_freq`
+gradient steps. Without the target network, both sides of the Bellman equation
+change simultaneously, causing training instability (the moving-target problem).
+
+#### Linear epsilon schedule
+
+```
+total_train_steps = (N − 1) × n_episodes
+
+At global step k:
+  ε(k) = max(ε_end, ε_start − (ε_start − ε_end) × k / total_train_steps)
+```
+
+Epsilon decays **linearly per environment step** from `ε_start=1.0` to
+`ε_end=0.01` over the full training run. This guarantees:
+- Early training: high ε → diverse random transitions fill the buffer
+- Late training: low ε → mostly greedy actions based on learned Q-values
+
+This is deliberately different from the tabular agent's per-episode exponential
+decay, because neural networks require many gradient steps to propagate
+Q-value information across the weight space — the agent must actually exploit
+its learned policy to generate useful on-policy data for further updates.
+
+| Property | Value |
 |---|---|
-| `_QNetwork` | `Input(n_features) → [Linear→ReLU→Dropout]×N → Linear(3)` |
-| `_ReplayBuffer` | Fixed-capacity `deque`; `.push()` / `.sample(batch_size)` |
-| Loss | Huber (smooth-L1) for robustness to reward outliers |
-| Gradient clipping | `max_norm=10.0` |
-| Input | Last timestep `X_seq[:, -1, :]` (same as Q-learning) |
-| Output | Softmax over Q-values with configurable temperature |
+| Loss | Huber / smooth-L1 |
+| Gradient clipping | `max_norm = 10.0` |
+| Optimizer | Adam |
+| Saves as | `.pt` (online network state_dict + all hyperparams) |
+| Tuning grid | 5 configs varying hidden_sizes ∈ {[128,64],[256,128],[128,64,32]}, dropout ∈ {0.2,0.3}, lr ∈ {0.001,0.0005} |
+
+---
 
 ### Ensemble Weighting
 
