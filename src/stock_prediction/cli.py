@@ -641,6 +641,158 @@ def lookup(query: str):
     console.print(f"[dim]Saved: {lookup_path}[/dim]")
 
 
+@cli.command("experiment")
+@click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
+@click.option("--models", "-m", required=True,
+              help="Comma-separated algorithms to test (e.g. lstm,encoder_decoder)")
+@click.option("--start-date", default=None, help="Training start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="Training end date (YYYY-MM-DD)")
+@click.option("--horizon", default=None, type=int,
+              help="Prediction horizon in days (overrides config)")
+@click.option("--no-news", is_flag=True, help="Disable news features")
+@click.option("--no-llm", is_flag=True, help="Disable LLM features")
+@click.option("--no-financials", is_flag=True, help="Disable financial features")
+def experiment(symbol: str, models: str, start_date: str | None, end_date: str | None,
+               horizon: int | None, no_news: bool, no_llm: bool, no_financials: bool):
+    """Train individual algorithms in an isolated sandbox for a symbol.
+
+    Each algorithm is saved to its own timestamped directory under
+    data/models/<SYMBOL>/experimental/ and never touches the production model.
+    Use list-experiments to compare results and promote to promote the best one.
+    """
+    from datetime import datetime as _dt
+    from stock_prediction.models.trainer import ModelTrainer, AVAILABLE_MODELS
+    from stock_prediction.config import load_settings
+    from rich.table import Table
+
+    selected = [m.strip().lower() for m in models.split(",")]
+    invalid = [m for m in selected if m not in AVAILABLE_MODELS]
+    if invalid:
+        console.print(f"[red]Unknown algorithm(s): {invalid}. Available: {AVAILABLE_MODELS}[/]")
+        return
+
+    if horizon is not None:
+        load_settings()["features"]["prediction_horizon"] = horizon
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+    sym_key  = symbol.replace(".", "_")
+
+    trainer = ModelTrainer(
+        use_news=not no_news, use_llm=not no_llm, use_financials=not no_financials
+    )
+
+    results = []
+    for alg in selected:
+        run_id  = f"{_dt.now():%Y%m%d_%H%M%S}_{alg}"
+        run_dir = save_dir / sym_key / "experimental" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"Training [bold]{alg}[/] → {run_dir.name} …")
+        try:
+            model, accuracy, _ = trainer.train_stock(
+                symbol, start_date, end_date, [alg], experiment_dir=run_dir
+            )
+            if model is None:
+                results.append((run_id, alg, "no_data", None))
+                console.print(f"  [yellow]⚠ No training data[/]")
+            else:
+                results.append((run_id, alg, "success", accuracy))
+                acc_str = f"{accuracy:.1%}" if accuracy is not None else "—"
+                console.print(f"  [green]✓ val accuracy: {acc_str}[/]")
+        except Exception as e:
+            results.append((run_id, alg, "failed", None))
+            console.print(f"  [red]✗ {e}[/]")
+
+    # Summary table
+    table = Table(title=f"Experimental Results — {symbol}", show_header=True)
+    table.add_column("Run ID",       style="dim")
+    table.add_column("Algorithm",    style="bold")
+    table.add_column("Val Accuracy", justify="right")
+    table.add_column("Status")
+    for run_id, alg, status, acc in results:
+        acc_str    = f"{acc:.1%}" if acc is not None else "—"
+        status_str = {"success": "[green]success[/]", "no_data": "[yellow]no data[/]",
+                      "failed": "[red]failed[/]"}.get(status, status)
+        table.add_row(run_id, alg, acc_str, status_str)
+    console.print(table)
+    console.print("[dim]Use 'stockpredict list-experiments -s SYMBOL' to compare all runs.[/dim]")
+    console.print("[dim]Use 'stockpredict promote -s SYMBOL --run-id RUN_ID' to go live.[/dim]")
+
+
+@cli.command("list-experiments")
+@click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
+def list_experiments_cmd(symbol: str):
+    """List all experimental runs for a symbol with their val accuracies."""
+    from stock_prediction.models.trainer import list_experiments
+    from rich.table import Table
+    from rich.text import Text
+
+    save_dir    = Path(get_setting("models", "save_dir", default="data/models"))
+    experiments = list_experiments(symbol, save_dir)
+
+    if not experiments:
+        console.print(f"[yellow]No experimental runs found for {symbol}.[/yellow]")
+        return
+
+    table = Table(title=f"Experimental Runs — {symbol}", show_header=True)
+    table.add_column("Run ID",       style="dim")
+    table.add_column("Algorithm",    style="bold")
+    table.add_column("Val Accuracy", justify="right")
+    table.add_column("Trained At")
+    table.add_column("Horizon", justify="right")
+
+    for exp in experiments:
+        sel        = exp.get("selected_models") or []
+        alg_label  = ", ".join(sel) if sel else exp["run_id"].split("_", 2)[-1]
+        acc        = exp.get("val_accuracy")
+        acc_str    = f"{acc:.1%}" if acc is not None else "—"
+        trained_at = (exp.get("trained_at") or "")[:16].replace("T", " ") or "—"
+        horizon    = str(exp.get("horizon", "—"))
+        table.add_row(exp["run_id"], alg_label, acc_str, trained_at, horizon)
+
+    console.print(table)
+    console.print("[dim]Use 'stockpredict promote -s SYMBOL --run-id RUN_ID' to promote a run.[/dim]")
+
+
+@cli.command("promote")
+@click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
+@click.option("--run-id", "-r", required=True, help="Experimental run ID to promote")
+@click.confirmation_option(prompt="This will overwrite the production model. Continue?")
+def promote_cmd(symbol: str, run_id: str):
+    """Promote an experimental run to production."""
+    from stock_prediction.models.trainer import promote_experiment
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+    run_dir  = save_dir / symbol.replace(".", "_") / "experimental" / run_id
+
+    if not run_dir.exists():
+        console.print(f"[red]Run not found: {run_dir}[/]")
+        console.print("[dim]Use 'stockpredict list-experiments -s SYMBOL' to see available runs.[/dim]")
+        return
+
+    promote_experiment(symbol, run_dir, save_dir)
+    console.print(f"[green]✓ Promoted {run_id} → production for {symbol}[/]")
+    console.print(f"[dim]All prediction commands will now use the promoted model.[/dim]")
+
+
+@cli.command("delete-experiment")
+@click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
+@click.option("--run-id", "-r", required=True, help="Experimental run ID to delete")
+@click.confirmation_option(prompt="Delete this experimental run?")
+def delete_experiment(symbol: str, run_id: str):
+    """Delete an experimental run directory."""
+    import shutil
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+    run_dir  = save_dir / symbol.replace(".", "_") / "experimental" / run_id
+
+    if not run_dir.exists():
+        console.print(f"[red]Run not found: {run_dir}[/]")
+        return
+
+    shutil.rmtree(run_dir)
+    console.print(f"[green]✓ Deleted {run_id}[/]")
+
+
 @cli.command("model-info")
 @click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
 def model_info(symbol: str):
