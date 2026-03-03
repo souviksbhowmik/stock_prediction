@@ -176,6 +176,14 @@ class TemporalFusionTransformer(nn.Module):
 
         # 5. Output projection
         self.output_proj = nn.Linear(hidden_size, horizon)
+        # Price ratios are centred on 1.0 (no-change), not 0.0.
+        # Initialising all output biases to 1.0 means the untrained model
+        # already predicts "no change" for every horizon step, so training
+        # only needs to learn deviations.  Without this, the default near-zero
+        # bias causes the model to output ratios ≈ 0 (return ≈ −1.0), which
+        # collapses residual_std to ≈ 1e-4 and forces predict_proba to return
+        # 100% SELL for every sample.
+        nn.init.constant_(self.output_proj.bias, 1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -424,7 +432,9 @@ class TFTPredictor:
         pred_return = ratios[:, -1] - 1.0          # final-step return
 
         buy_thresh, sell_thresh = self._thresholds
-        sigma = self._residual_std
+        # Floor sigma so a newly loaded (not yet retrained) model doesn't
+        # collapse to a degenerate distribution and predict 100% SELL.
+        sigma = max(self._residual_std, 0.01)
 
         p_sell = norm.cdf(sell_thresh, loc=pred_return, scale=sigma)
         p_buy  = 1.0 - norm.cdf(buy_thresh, loc=pred_return, scale=sigma)
@@ -465,6 +475,8 @@ class TFTPredictor:
         self.dropout         = checkpoint.get("dropout", self.dropout)
         self.horizon         = checkpoint.get("horizon", self.horizon)
         self._residual_std   = checkpoint.get("residual_std", self._residual_std)
+        # Re-derive thresholds now that self.horizon is final
+        self._thresholds = HORIZON_THRESHOLDS.get(self.horizon, (0.022, -0.022))
         self.model = TemporalFusionTransformer(
             input_size=self.input_size,
             hidden_size=self.hidden_size,
