@@ -190,10 +190,13 @@ def _color_short(val: str) -> str:
 def _show_table(
     df: pd.DataFrame,
     style_map: dict | None = None,
+    tooltip_cols: set[str] | None = None,
 ) -> None:
     """Render a DataFrame as a copyable HTML table with optional per-column cell styling.
 
-    style_map: {column_name: callable(value) -> css_string}
+    style_map:   {column_name: callable(value) -> css_string}
+    tooltip_cols: set of column names whose content is truncated in the cell and shown
+                  in full as a native browser tooltip on hover.
     """
     cols = list(df.columns)
     headers = "".join(f"<th>{c}</th>" for c in cols)
@@ -204,8 +207,15 @@ def _show_table(
         for col in cols:
             val = "" if row[col] is None else str(row[col])
             css = style_map[col](val) if (style_map and col in style_map) else ""
-            style_attr = f' style="{css}"' if css else ""
-            cells.append(f"<td{style_attr}>{val}</td>")
+            if tooltip_cols and col in tooltip_cols and val not in ("", "—"):
+                css = (css + ";" if css else "") + (
+                    "max-width:160px;overflow:hidden;text-overflow:ellipsis;"
+                    "white-space:nowrap;cursor:default"
+                )
+                cells.append(f'<td style="{css}" title="{val}">{val}</td>')
+            else:
+                style_attr = f' style="{css}"' if css else ""
+                cells.append(f"<td{style_attr}>{val}</td>")
         body_rows.append(f"<tr>{''.join(cells)}</tr>")
 
     html = (
@@ -1466,6 +1476,7 @@ def page_portfolio() -> None:
     _show_table(
         pd.DataFrame(rows),
         style_map={"Unrealized PnL ₹": _color_pnl, "PnL %": _color_pnl},
+        tooltip_cols={"Comment"},
     )
 
     total_pnl = sum(t.pnl or 0 for t in trades)
