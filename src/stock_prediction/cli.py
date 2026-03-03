@@ -371,11 +371,13 @@ def screen(symbols: str | None, no_news: bool, no_llm: bool):
 @cli.command("test-buy")
 @click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. RELIANCE.NS)")
 @click.option("--amount", "-a", required=True, type=float, help="Amount in INR to invest")
-def test_buy(symbol: str, amount: float):
+@click.option("--portfolio", "-p", default="default", show_default=True,
+              help="Portfolio name (use 'default' for the main portfolio)")
+def test_buy(symbol: str, amount: float, portfolio: str):
     """Paper trade: Buy a stock (open LONG or cover SHORT)."""
     from stock_prediction.signals.paper_trading import PaperTradingManager
 
-    manager = PaperTradingManager()
+    manager = PaperTradingManager(portfolio=portfolio)
     try:
         trade = manager.buy(symbol, amount)
         if trade.status == "CLOSED":
@@ -392,11 +394,13 @@ def test_buy(symbol: str, amount: float):
 @cli.command("test-sell")
 @click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. RELIANCE.NS)")
 @click.option("--trade-id", default=None, help="Specific trade ID to close")
-def test_sell(symbol: str, trade_id: str | None):
+@click.option("--portfolio", "-p", default="default", show_default=True,
+              help="Portfolio name (use 'default' for the main portfolio)")
+def test_sell(symbol: str, trade_id: str | None, portfolio: str):
     """Paper trade: Sell a stock (close LONG or cover SHORT)."""
     from stock_prediction.signals.paper_trading import PaperTradingManager
 
-    manager = PaperTradingManager()
+    manager = PaperTradingManager(portfolio=portfolio)
     try:
         trade = manager.sell(symbol, trade_id=trade_id)
         pnl_color = "green" if (trade.pnl or 0) >= 0 else "red"
@@ -410,11 +414,13 @@ def test_sell(symbol: str, trade_id: str | None):
 @cli.command("test-short")
 @click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. RELIANCE.NS)")
 @click.option("--amount", "-a", required=True, type=float, help="Amount in INR")
-def test_short(symbol: str, amount: float):
+@click.option("--portfolio", "-p", default="default", show_default=True,
+              help="Portfolio name (use 'default' for the main portfolio)")
+def test_short(symbol: str, amount: float, portfolio: str):
     """Paper trade: Short sell a stock (open SHORT position)."""
     from stock_prediction.signals.paper_trading import PaperTradingManager
 
-    manager = PaperTradingManager()
+    manager = PaperTradingManager(portfolio=portfolio)
     try:
         trade = manager.short_sell(symbol, amount)
         console.print(f"[bold magenta]SHORT {symbol}[/] — {trade.quantity:.4f} shares @ INR {trade.entry_price:.2f}")
@@ -424,12 +430,14 @@ def test_short(symbol: str, amount: float):
 
 
 @cli.command("test-portfolio")
-def test_portfolio():
+@click.option("--portfolio", "-p", default="default", show_default=True,
+              help="Portfolio name (use 'default' for the main portfolio)")
+def test_portfolio(portfolio: str):
     """Paper trade: Show open positions and unrealized PnL."""
     from stock_prediction.signals.paper_trading import PaperTradingManager
     from stock_prediction.signals.report import ReportFormatter
 
-    manager = PaperTradingManager()
+    manager = PaperTradingManager(portfolio=portfolio)
     reporter = ReportFormatter()
 
     trades = manager.get_portfolio()
@@ -438,12 +446,14 @@ def test_portfolio():
 
 @cli.command("test-calculate-gain")
 @click.option("--export", is_flag=True, help="Export report to JSON file")
-def test_calculate_gain(export: bool):
+@click.option("--portfolio", "-p", default="default", show_default=True,
+              help="Portfolio name (use 'default' for the main portfolio)")
+def test_calculate_gain(export: bool, portfolio: str):
     """Paper trade: Calculate gain/loss report for all closed trades."""
     from stock_prediction.signals.paper_trading import PaperTradingManager
     from stock_prediction.signals.report import ReportFormatter
 
-    manager = PaperTradingManager()
+    manager = PaperTradingManager(portfolio=portfolio)
     reporter = ReportFormatter()
 
     report = manager.calculate_gains()

@@ -300,21 +300,40 @@ stockpredict lookup hdfc          # matches by ticker prefix
 
 ## Step 7: Paper Trading
 
-Simulate trades without real money to test your strategy. All positions and trade history are persisted in `data/trades/ledger.json` and updated on every operation.
+Simulate trades without real money to test your strategy. Positions and trade history are persisted in ledger files under `data/trades/` and updated on every operation.
+
+### Portfolios
+
+All five paper-trading commands accept a `--portfolio / -p` flag that lets you maintain separate, named ledgers. Omitting the flag always uses the `"default"` portfolio.
+
+| Portfolio name | Ledger file |
+|---|---|
+| `default` (or omitted) | `data/trades/ledger.json` |
+| `swing` | `data/trades/ledger_swing.json` |
+| `long_term` | `data/trades/ledger_long_term.json` |
+| any `<name>` | `data/trades/ledger_<name>.json` |
+
+Portfolio names are sanitised before becoming filenames — characters that are not alphanumeric, `-`, or `_` are replaced with `_`. An empty name after sanitisation falls back to `"default"`.
+
+Portfolio discovery is automatic: the system scans `data/trades/` for `ledger_*.json` files on every run, so any portfolio created by a previous command is immediately available in later commands and in the Streamlit UI.
+
+---
 
 ### `test-buy` — Open a Long Position
 
 **What it does:**
-Fetches the current market price for the symbol from yfinance, calculates the number of shares purchasable for the given amount (INR), and records an OPEN LONG trade in the ledger. If an existing open SHORT position exists for the symbol it covers that instead.
+Fetches the current market price for the symbol from yfinance, calculates the number of shares purchasable for the given amount (INR), and records an OPEN LONG trade in the portfolio's ledger. If an existing open SHORT position exists for the symbol in that portfolio it covers that instead.
 
 **Dependencies:** None on prior steps, but practically used after reviewing signals from `predict` or `analyze`.
 
 **Output:**
 - Console: Confirmation with entry price, quantity, and trade ID
-- File: `data/trades/ledger.json` — updated with the new trade
+- File: `data/trades/ledger[_<name>].json` — updated with the new trade
 
 ```bash
-stockpredict test-buy -s RELIANCE.NS -a 50000
+stockpredict test-buy -s RELIANCE.NS -a 50000            # default portfolio
+stockpredict test-buy -s RELIANCE.NS -a 50000 -p swing   # swing portfolio
+stockpredict test-buy -s TCS.NS -a 100000 -p long_term   # long-term portfolio
 ```
 
 ---
@@ -322,16 +341,17 @@ stockpredict test-buy -s RELIANCE.NS -a 50000
 ### `test-short` — Open a Short Position
 
 **What it does:**
-Fetches the current price, records an OPEN SHORT trade in the ledger at that price. Profit is realised when the price drops below the entry price at close time.
+Fetches the current price, records an OPEN SHORT trade in the portfolio's ledger at that price. Profit is realised when the price drops below the entry price at close time.
 
 **Dependencies:** None on prior steps.
 
 **Output:**
 - Console: Confirmation with entry price, quantity, and trade ID
-- File: `data/trades/ledger.json` — updated
+- File: `data/trades/ledger[_<name>].json` — updated
 
 ```bash
-stockpredict test-short -s TCS.NS -a 30000
+stockpredict test-short -s TCS.NS -a 30000               # default portfolio
+stockpredict test-short -s TCS.NS -a 30000 -p swing      # swing portfolio
 ```
 
 ---
@@ -339,17 +359,18 @@ stockpredict test-short -s TCS.NS -a 30000
 ### `test-sell` — Close a Position
 
 **What it does:**
-Fetches the current market price, closes the most recent (or specified) open position for the symbol, calculates realised PnL `(exit - entry) × qty` for LONG or `(entry - exit) × qty` for SHORT, and marks the trade CLOSED in the ledger.
+Fetches the current market price, closes the most recent (or specified) open position for the symbol in the selected portfolio, calculates realised PnL `(exit - entry) × qty` for LONG or `(entry - exit) × qty` for SHORT, and marks the trade CLOSED in the ledger.
 
-**Dependencies:** An open position must exist for the symbol (created via `test-buy` or `test-short`).
+**Dependencies:** An open position must exist for the symbol in the selected portfolio (created via `test-buy` or `test-short`).
 
 **Output:**
 - Console: Confirmation with exit price and realised PnL (INR and %)
-- File: `data/trades/ledger.json` — trade updated to CLOSED status
+- File: `data/trades/ledger[_<name>].json` — trade updated to CLOSED status
 
 ```bash
-stockpredict test-sell -s RELIANCE.NS
-stockpredict test-sell -s TCS.NS --trade-id abc123       # Close specific trade
+stockpredict test-sell -s RELIANCE.NS                        # default portfolio
+stockpredict test-sell -s TCS.NS --trade-id abc123           # close specific trade
+stockpredict test-sell -s RELIANCE.NS -p swing               # swing portfolio
 ```
 
 ---
@@ -357,16 +378,18 @@ stockpredict test-sell -s TCS.NS --trade-id abc123       # Close specific trade
 ### `test-portfolio` — View Open Positions
 
 **What it does:**
-Reads all OPEN trades from the ledger, fetches current market prices for each symbol, and computes unrealized PnL for every position. Displays a summary of total capital deployed and aggregate unrealized gain/loss.
+Reads all OPEN trades from the selected portfolio's ledger, fetches current market prices for each symbol, and computes unrealized PnL for every position. Displays a summary of total capital deployed and aggregate unrealized gain/loss.
 
-**Dependencies:** Open positions must exist in the ledger.
+**Dependencies:** Open positions must exist in the selected portfolio's ledger.
 
 **Output:**
 - Console: Rich table of all open positions with entry price, current price, quantity, amount, PnL, and PnL %
 - File: `data/reports/portfolio.csv` — same data in CSV. Overwritten on each run.
 
 ```bash
-stockpredict test-portfolio
+stockpredict test-portfolio                                  # default portfolio
+stockpredict test-portfolio -p swing                         # swing portfolio
+stockpredict test-portfolio -p long_term                     # long-term portfolio
 ```
 
 ---
@@ -374,9 +397,9 @@ stockpredict test-portfolio
 ### `test-calculate-gain` — Gain / Loss Report
 
 **What it does:**
-Reads all CLOSED trades from the ledger and computes aggregate statistics: total trades, win/loss count, win rate, total PnL (INR and %), best and worst individual trades, and a per-symbol breakdown. Also reads OPEN trades and computes current unrealized PnL by fetching live prices.
+Reads all CLOSED trades from the selected portfolio's ledger and computes aggregate statistics: total trades, win/loss count, win rate, total PnL (INR and %), best and worst individual trades, and a per-symbol breakdown. Also reads OPEN trades and computes current unrealized PnL by fetching live prices.
 
-**Dependencies:** Closed positions must exist in the ledger (from `test-sell`).
+**Dependencies:** Closed positions must exist in the selected portfolio's ledger (from `test-sell`).
 
 **Output:**
 - Console: Summary metrics table, best/worst trade callouts, Per-Stock Breakdown table
@@ -387,8 +410,9 @@ Reads all CLOSED trades from the ledger and computes aggregate statistics: total
   - `data/trades/report_YYYY-MM-DD.json` — full gain report in JSON
 
 ```bash
-stockpredict test-calculate-gain
-stockpredict test-calculate-gain --export                # Export to JSON
+stockpredict test-calculate-gain                             # default portfolio
+stockpredict test-calculate-gain -p swing                    # swing portfolio
+stockpredict test-calculate-gain -p swing --export           # export swing portfolio report to JSON
 ```
 
 ---
@@ -409,7 +433,9 @@ The UI mirrors all CLI functionality with additional visualisation. Key pages:
 | **Predict** | Run predictions for trained symbols. Feature flags and horizon are loaded automatically from the model — no user input needed. Each row has an **ℹ️** button showing model metadata (trained date, horizon, val accuracy, models used, feature flags). Each row also has a **📊** button to view the interactive training plots. |
 | **Analyze** | Deep-dive analysis for a single stock with LLM broker scores and chart. |
 | **Suggest** | Screener-style ranked watchlist without requiring trained models. |
-| **Paper Trade** | Open/close positions, view portfolio, compute gain/loss. |
+| **Paper Trade** | Open/close positions with portfolio selection. A dropdown lists all discovered portfolios; choose "➕ Create new…" and type a name to start a new named ledger. |
+| **Portfolio** | View open positions for any portfolio. Switching the portfolio selector clears the cached data so the table refreshes against the correct ledger. |
+| **Gain Report** | Closed-trade analysis for any portfolio. Same portfolio selector and cache-clearing behaviour as the Portfolio page. |
 
 ---
 
@@ -445,9 +471,9 @@ The UI mirrors all CLI functionality with additional visualisation. Key pages:
 | `screen` | 4 screener tables | `top_picks.csv`, `sector_momentum.csv`, `news_alerts.csv`, `signals.csv`, `short_candidates.csv` | — |
 | `lookup` | Matched stocks with signals | `lookup.csv` | — |
 | `analyze` | Signal + LLM analysis | `analyze.csv` (broker scores) | — |
-| `test-buy` | Trade confirmation | — | `data/trades/ledger.json` |
-| `test-short` | Trade confirmation | — | `data/trades/ledger.json` |
-| `test-sell` | PnL confirmation | — | `data/trades/ledger.json` |
+| `test-buy` | Trade confirmation | — | `data/trades/ledger[_<name>].json` |
+| `test-short` | Trade confirmation | — | `data/trades/ledger[_<name>].json` |
+| `test-sell` | PnL confirmation | — | `data/trades/ledger[_<name>].json` |
 | `test-portfolio` | Open positions table | `portfolio.csv` | — |
 | `test-calculate-gain` | Summary + per-stock tables | `gain_summary.csv`, `gain_per_stock.csv` | `data/trades/report_YYYY-MM-DD.json` (with `--export`) |
 

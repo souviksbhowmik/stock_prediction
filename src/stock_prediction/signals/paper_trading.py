@@ -13,6 +13,27 @@ from stock_prediction.utils.logging import get_logger
 logger = get_logger("signals.paper_trading")
 
 
+def _portfolio_ledger_path(portfolio: str) -> Path:
+    """Return the ledger file path for a portfolio name."""
+    report_dir = Path(get_setting("paper_trading", "report_dir", default="data/trades"))
+    if portfolio == "default":
+        return Path(get_setting("paper_trading", "ledger_file", default="data/trades/ledger.json"))
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in portfolio.strip())
+    return report_dir / f"ledger_{safe}.json"
+
+
+def list_portfolios() -> list[str]:
+    """Return portfolio names by scanning for ledger files on disk."""
+    report_dir = Path(get_setting("paper_trading", "report_dir", default="data/trades"))
+    names: list[str] = ["default"]
+    if report_dir.exists():
+        for f in sorted(report_dir.glob("ledger_*.json")):
+            name = f.stem[len("ledger_"):]  # strip "ledger_" prefix
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 @dataclass
 class PaperTrade:
     trade_id: str
@@ -48,13 +69,12 @@ class GainReport:
 class PaperTradingManager:
     """Manages the paper trade ledger file."""
 
-    def __init__(self, ledger_path: str | Path | None = None):
+    def __init__(self, ledger_path: str | Path | None = None, portfolio: str = "default"):
         if ledger_path is not None:
             self.ledger_path = Path(ledger_path)
         else:
-            self.ledger_path = Path(
-                get_setting("paper_trading", "ledger_file", default="data/trades/ledger.json")
-            )
+            self.ledger_path = _portfolio_ledger_path(portfolio)
+        self.portfolio = portfolio
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
     def buy(self, symbol: str, amount: float, comment: str = "") -> PaperTrade:

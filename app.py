@@ -1330,6 +1330,19 @@ def page_trade() -> None:
     st.title("💰 Trade — Paper Trading")
     st.caption("Simulate buy, sell, and short-sell trades with virtual money. No real capital at risk.")
 
+    from stock_prediction.signals.paper_trading import list_portfolios as _list_portfolios
+    portfolios = _list_portfolios()
+    p_col1, p_col2 = st.columns([2, 2])
+    with p_col1:
+        portfolio_choice = st.selectbox(
+            "Portfolio", options=portfolios + ["➕ Create new…"], key="td_portfolio"
+        )
+    with p_col2:
+        new_port = ""
+        if portfolio_choice == "➕ Create new…":
+            new_port = st.text_input("New portfolio name", placeholder="e.g. swing_trades", key="td_new_port")
+    portfolio_name = (new_port.strip() or "default") if portfolio_choice == "➕ Create new…" else portfolio_choice
+
     col1, col2 = st.columns(2)
     with col1:
         symbol = st.text_input("Symbol", placeholder="e.g. RELIANCE.NS", key="td_sym")
@@ -1364,7 +1377,7 @@ def page_trade() -> None:
         with st.spinner(f"Executing {action} for {sym} …"):
             try:
                 from stock_prediction.signals.paper_trading import PaperTradingManager
-                manager = PaperTradingManager()
+                manager = PaperTradingManager(portfolio=portfolio_name)
 
                 comment = comment_input.strip()
 
@@ -1408,11 +1421,20 @@ def page_portfolio() -> None:
     st.title("💼 Portfolio — Open Positions")
     st.caption("Shows all open paper trades with live unrealized P&L (fetches current prices).")
 
+    from stock_prediction.signals.paper_trading import list_portfolios as _list_portfolios
+    portfolios = _list_portfolios()
+    portfolio_name = st.selectbox("Portfolio", options=portfolios, key="pf_portfolio")
+
+    # Clear stale cache when portfolio changes
+    if st.session_state.get("_pf_last_portfolio") != portfolio_name:
+        st.session_state["portfolio_trades"] = None
+        st.session_state["_pf_last_portfolio"] = portfolio_name
+
     if st.button("🔄 Refresh Portfolio", type="primary", key="pf_refresh"):
         with st.spinner("Fetching current prices …"):
             try:
                 from stock_prediction.signals.paper_trading import PaperTradingManager
-                st.session_state.portfolio_trades = PaperTradingManager().get_portfolio()
+                st.session_state.portfolio_trades = PaperTradingManager(portfolio=portfolio_name).get_portfolio()
             except Exception as e:
                 st.error(f"Portfolio error: {e}")
                 return
@@ -1459,11 +1481,20 @@ def page_gain_report() -> None:
     st.title("📈 Gain Report — Closed Trade Analysis")
     st.caption("Calculates realized gains and losses across all closed paper trades.")
 
+    from stock_prediction.signals.paper_trading import list_portfolios as _list_portfolios
+    portfolios = _list_portfolios()
+    portfolio_name = st.selectbox("Portfolio", options=portfolios, key="gr_portfolio")
+
+    # Clear stale cache when portfolio changes
+    if st.session_state.get("_gr_last_portfolio") != portfolio_name:
+        st.session_state["gain_report"] = None
+        st.session_state["_gr_last_portfolio"] = portfolio_name
+
     if st.button("📊 Calculate Gains", type="primary", key="gr_run"):
         with st.spinner("Calculating …"):
             try:
                 from stock_prediction.signals.paper_trading import PaperTradingManager
-                st.session_state.gain_report = PaperTradingManager().calculate_gains()
+                st.session_state.gain_report = PaperTradingManager(portfolio=portfolio_name).calculate_gains()
             except Exception as e:
                 st.error(f"Error: {e}")
                 return
