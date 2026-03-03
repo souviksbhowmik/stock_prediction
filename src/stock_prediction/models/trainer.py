@@ -13,6 +13,7 @@ from stock_prediction.config import get_setting
 from stock_prediction.features.pipeline import FeaturePipeline
 from stock_prediction.models.lstm_model import LSTMPredictor
 from stock_prediction.models.xgboost_model import XGBoostPredictor
+from stock_prediction.models.xgboost_lag_model import XGBoostLagPredictor
 from stock_prediction.models.encoder_decoder_model import EncoderDecoderPredictor
 from stock_prediction.models.prophet_model import ProphetPredictor
 from stock_prediction.models.tft_model import TFTPredictor
@@ -26,7 +27,7 @@ logger = get_logger("models.trainer")
 
 # Models that can be selected for training.  Add new model IDs here as they
 # are implemented.
-AVAILABLE_MODELS: list[str] = ["lstm", "xgboost", "encoder_decoder", "prophet", "tft", "qlearning", "dqn"]
+AVAILABLE_MODELS: list[str] = ["lstm", "xgboost", "xgboost_lag", "encoder_decoder", "prophet", "tft", "qlearning", "dqn"]
 
 # ---------------------------------------------------------------------------
 # Hyperparameter search grids
@@ -141,6 +142,7 @@ class ModelTrainer:
 
         use_lstm          = "lstm"           in selected_models
         use_xgboost       = "xgboost"        in selected_models
+        use_xgboost_lag   = "xgboost_lag"    in selected_models
         use_encoder_decoder = "encoder_decoder" in selected_models
         use_prophet       = "prophet"        in selected_models
         use_tft           = "tft"            in selected_models
@@ -159,7 +161,7 @@ class ModelTrainer:
         labels: np.ndarray | None = None
         feature_names: list[str] = []
 
-        if use_lstm or use_xgboost or use_encoder_decoder or use_tft or use_qlearning or use_dqn:
+        if use_lstm or use_xgboost or use_xgboost_lag or use_encoder_decoder or use_tft or use_qlearning or use_dqn:
             sequences, tabular, labels, feature_names = (
                 self.pipeline.prepare_training_data(symbol, start_date, end_date)
             )
@@ -179,7 +181,27 @@ class ModelTrainer:
             except Exception:
                 n_samples, seq_len, n_features = 0, 60, 0
 
-        # ── 1b. Regression data (Encoder-Decoder + TFT) ──────────────────
+        # ── 1b. Lag tabular data (XGBoostLag) ────────────────────────────
+        tabular_lag: np.ndarray | None = None
+        labels_lag: np.ndarray | None = None
+        feature_names_lag: list[str] = []
+        n_lag = 0
+        if use_xgboost_lag:
+            try:
+                tabular_lag, labels_lag, feature_names_lag = (
+                    self.pipeline.prepare_training_data_lag(symbol, start_date, end_date)
+                )
+                n_lag = len(tabular_lag)
+                if n_lag == 0:
+                    logger.warning(f"No lag data for {symbol}, skipping xgboost_lag")
+                    use_xgboost_lag = False
+                    selected_models = [m for m in selected_models if m != "xgboost_lag"]
+            except Exception as e:
+                logger.warning(f"Lag feature build failed for {symbol}: {e}, skipping xgboost_lag")
+                use_xgboost_lag = False
+                selected_models = [m for m in selected_models if m != "xgboost_lag"]
+
+        # ── 1c. Regression data (Encoder-Decoder + TFT) ──────────────────
         seq_reg: np.ndarray | None = None
         reg_targets: np.ndarray | None = None
         labels_reg: np.ndarray | None = None
@@ -240,6 +262,23 @@ class ModelTrainer:
             X_seq_train_s = X_seq_val_s = np.zeros((0, seq_len if seq_len else 60, n_features))
             y_train = y_val = np.zeros(0, dtype=np.int64)
 
+        # Lag split (xgboost_lag — independent of base split/scaler)
+        lag_scaler = StandardScaler()
+        X_lag_train_s: np.ndarray = np.zeros((0, 1))
+        X_lag_val_s:   np.ndarray = np.zeros((0, 1))
+        y_lag_train:   np.ndarray = np.zeros(0, dtype=np.int64)
+        y_lag_val:     np.ndarray = np.zeros(0, dtype=np.int64)
+        sample_weights_lag_train: np.ndarray = np.ones(0)
+        split_idx_lag = 0
+
+        if use_xgboost_lag and tabular_lag is not None and labels_lag is not None and n_lag > 0:
+            split_idx_lag = int(n_lag * self.train_split)
+            X_lag_train_s = lag_scaler.fit_transform(tabular_lag[:split_idx_lag])
+            X_lag_val_s   = lag_scaler.transform(tabular_lag[split_idx_lag:])
+            y_lag_train   = labels_lag[:split_idx_lag]
+            y_lag_val     = labels_lag[split_idx_lag:]
+            sample_weights_lag_train = compute_sample_weight("balanced", y=y_lag_train) if len(y_lag_train) > 0 else np.ones(len(y_lag_train))
+
         # Regression split (encoder-decoder)
         X_seq_reg_train_s: np.ndarray | None = None
         X_seq_reg_val_s: np.ndarray | None = None
@@ -297,11 +336,22 @@ class ModelTrainer:
         best_dqn_params: dict = {}
         dqn_val_acc = 0.0
 
+        best_xgb_lag_params: dict = {}
+        best_n_estimators_lag = 0
+        xgb_lag_val_acc = 0.0
+
         if use_xgboost and len(X_tab_train_s) > 0:
             logger.info(f"Tuning XGBoost for {symbol}...")
             best_xgb_params, best_n_estimators, xgb_val_acc = self._tune_xgboost(
                 X_tab_train_s, y_train, X_tab_val_s, y_val,
                 sample_weight=sample_weights_train,
+            )
+
+        if use_xgboost_lag and len(X_lag_train_s) > 0:
+            logger.info(f"Tuning XGBoostLag for {symbol}...")
+            best_xgb_lag_params, best_n_estimators_lag, xgb_lag_val_acc = self._tune_xgboost_lag(
+                X_lag_train_s, y_lag_train, X_lag_val_s, y_lag_val,
+                sample_weight=sample_weights_lag_train,
             )
 
         if use_lstm and len(X_seq_train_s) > 0:
@@ -360,6 +410,7 @@ class ModelTrainer:
         accs: dict[str, float] = {}
         if use_lstm:          accs["lstm"]           = lstm_val_acc
         if use_xgboost:       accs["xgboost"]        = xgb_val_acc
+        if use_xgboost_lag:   accs["xgboost_lag"]    = xgb_lag_val_acc
         if use_encoder_decoder: accs["encoder_decoder"] = ed_val_acc
         if use_prophet:       accs["prophet"]        = prophet_val_acc
         if use_tft:           accs["tft"]            = tft_val_acc
@@ -374,13 +425,14 @@ class ModelTrainer:
         else:
             for k in accs: accs[k] = 1.0 / len(accs)
 
-        lstm_weight    = accs.get("lstm", 0.0)
-        xgb_weight     = accs.get("xgboost", 0.0)
-        ed_weight      = accs.get("encoder_decoder", 0.0)
-        prophet_weight = accs.get("prophet", 0.0)
-        tft_weight     = accs.get("tft", 0.0)
-        ql_weight      = accs.get("qlearning", 0.0)
-        dqn_weight     = accs.get("dqn", 0.0)
+        lstm_weight        = accs.get("lstm", 0.0)
+        xgb_weight         = accs.get("xgboost", 0.0)
+        xgb_lag_weight     = accs.get("xgboost_lag", 0.0)
+        ed_weight          = accs.get("encoder_decoder", 0.0)
+        prophet_weight     = accs.get("prophet", 0.0)
+        tft_weight         = accs.get("tft", 0.0)
+        ql_weight          = accs.get("qlearning", 0.0)
+        dqn_weight         = accs.get("dqn", 0.0)
 
         logger.info(
             f"Ensemble weights for {symbol}: "
@@ -397,6 +449,7 @@ class ModelTrainer:
         val_accuracy = (
             lstm_weight * lstm_val_acc
             + xgb_weight * xgb_val_acc
+            + xgb_lag_weight * xgb_lag_val_acc
             + ed_weight * ed_val_acc
             + prophet_weight * prophet_val_acc
             + tft_weight * tft_val_acc
@@ -429,7 +482,8 @@ class ModelTrainer:
             else np.ones(len(X_tab_full_s))
         )
 
-        xgb_final: XGBoostPredictor | None = None
+        xgb_final:     XGBoostPredictor    | None = None
+        xgb_lag_final: XGBoostLagPredictor | None = None
         lstm_final: LSTMPredictor | None = None
         ed_final: EncoderDecoderPredictor | None = None
         prophet_final: ProphetPredictor | None = None
@@ -444,6 +498,22 @@ class ModelTrainer:
             )
             xgb_final.train(X_tab_full_s, labels, feature_names=feature_names,
                             sample_weight=sample_weights_full)
+
+        if use_xgboost_lag and tabular_lag is not None and n_lag > 0:
+            full_lag_scaler = StandardScaler()
+            X_lag_full_s = full_lag_scaler.fit_transform(tabular_lag)
+            sample_weights_lag_full = (
+                compute_sample_weight("balanced", y=labels_lag)
+                if labels_lag is not None and len(labels_lag) > 0
+                else np.ones(n_lag)
+            )
+            n_est_lag_full = max(best_n_estimators_lag, int(best_n_estimators_lag / self.train_split))
+            xgb_lag_final = XGBoostLagPredictor(
+                **best_xgb_lag_params, n_estimators=n_est_lag_full, early_stopping_rounds=None
+            )
+            xgb_lag_final.train(X_lag_full_s, labels_lag, feature_names=feature_names_lag,
+                                sample_weight=sample_weights_lag_full)
+            lag_scaler = full_lag_scaler  # replace split-fitted scaler with full-data scaler
 
         if use_lstm and len(X_seq_full_s) > 0:
             epochs_full = max(best_lstm_epochs, int(best_lstm_epochs / self.train_split))
@@ -524,6 +594,7 @@ class ModelTrainer:
         ensemble = EnsembleModel(
             lstm=lstm_final,
             xgboost=xgb_final,
+            xgboost_lag=xgb_lag_final,
             encoder_decoder=ed_final,
             prophet=prophet_final,
             tft=tft_final,
@@ -531,6 +602,7 @@ class ModelTrainer:
             dqn=dqn_final,
             lstm_weight=lstm_weight,
             xgboost_weight=xgb_weight,
+            xgboost_lag_weight=xgb_lag_weight,
             encoder_decoder_weight=ed_weight,
             prophet_weight=prophet_weight,
             tft_weight=tft_weight,
@@ -540,10 +612,12 @@ class ModelTrainer:
 
         # ── 7. Save ───────────────────────────────────────────────────────
         self._save_models(
-            symbol, lstm_final, xgb_final, ed_final, prophet_final, tft_final, ql_final, dqn_final,
+            symbol, lstm_final, xgb_final, xgb_lag_final, ed_final, prophet_final, tft_final, ql_final, dqn_final,
             full_scaler, full_seq_scaler, feature_names,
-            lstm_weight, xgb_weight, ed_weight, prophet_weight, tft_weight, ql_weight, dqn_weight,
+            lstm_weight, xgb_weight, xgb_lag_weight, ed_weight, prophet_weight, tft_weight, ql_weight, dqn_weight,
             selected_models, n_features,
+            lag_scaler=lag_scaler if use_xgboost_lag else None,
+            lag_feature_names=feature_names_lag if use_xgboost_lag else [],
             horizon=horizon,
             use_news=self.use_news,
             use_llm=self.use_llm,
@@ -649,6 +723,26 @@ class ModelTrainer:
             if acc > best_acc:
                 best_acc, best_params, best_n_est = acc, dict(params), n_est
         logger.info(f"Best XGB: {best_params}, n_estimators={best_n_est}, balanced_acc={best_acc:.4f}")
+        return best_params, best_n_est, best_acc
+
+    def _tune_xgboost_lag(
+        self,
+        X_train: np.ndarray, y_train: np.ndarray,
+        X_val: np.ndarray,   y_val: np.ndarray,
+        sample_weight: np.ndarray | None = None,
+    ) -> tuple[dict, int, float]:
+        """Grid-search XGBoostLag hyperparameters using the extended feature set."""
+        best_acc, best_params, best_n_est = -1.0, {}, 500
+        for params in _XGB_PARAM_GRID:
+            model = XGBoostLagPredictor(**params)
+            model.train(X_train, y_train, X_val, y_val, sample_weight=sample_weight)
+            acc = balanced_accuracy_score(y_val, model.predict(X_val))
+            n_est = getattr(model.model, "best_iteration",
+                            self._cfg_xgb_n_estimators()) + 1
+            logger.info(f"  XGBLag {params} → balanced_acc={acc:.4f}, best_iter={n_est}")
+            if acc > best_acc:
+                best_acc, best_params, best_n_est = acc, dict(params), n_est
+        logger.info(f"Best XGBLag: {best_params}, n_estimators={best_n_est}, balanced_acc={best_acc:.4f}")
         return best_params, best_n_est, best_acc
 
     def _tune_lstm(
@@ -927,21 +1021,23 @@ class ModelTrainer:
             else:
                 selected_models = [old_mode]
 
-        lstm_path  = model_dir / "lstm.pt"
-        xgb_path   = model_dir / "xgboost.joblib"
-        ed_path    = model_dir / "encoder_decoder.pt"
-        proph_path = model_dir / "prophet.joblib"
-        tft_path   = model_dir / "tft.pt"
-        ql_path    = model_dir / "qlearning.joblib"
-        dqn_path   = model_dir / "dqn.pt"
+        lstm_path    = model_dir / "lstm.pt"
+        xgb_path     = model_dir / "xgboost.joblib"
+        xgb_lag_path = model_dir / "xgboost_lag.joblib"
+        ed_path      = model_dir / "encoder_decoder.pt"
+        proph_path   = model_dir / "prophet.joblib"
+        tft_path     = model_dir / "tft.pt"
+        ql_path      = model_dir / "qlearning.joblib"
+        dqn_path     = model_dir / "dqn.pt"
 
-        lstm: LSTMPredictor | None = None
-        xgb:  XGBoostPredictor | None = None
-        ed:   EncoderDecoderPredictor | None = None
-        prophet: ProphetPredictor | None = None
-        tft: TFTPredictor | None = None
-        ql: QLearningPredictor | None = None
-        dqn: DQNPredictor | None = None
+        lstm:    LSTMPredictor          | None = None
+        xgb:     XGBoostPredictor       | None = None
+        xgb_lag: XGBoostLagPredictor    | None = None
+        ed:      EncoderDecoderPredictor | None = None
+        prophet: ProphetPredictor        | None = None
+        tft:     TFTPredictor            | None = None
+        ql:      QLearningPredictor      | None = None
+        dqn:     DQNPredictor            | None = None
 
         if "lstm" in selected_models:
             if not lstm_path.exists():
@@ -954,6 +1050,12 @@ class ModelTrainer:
                 raise FileNotFoundError(f"XGBoost model not found for {symbol}")
             xgb = XGBoostPredictor()
             xgb.load(xgb_path)
+
+        if "xgboost_lag" in selected_models:
+            if not xgb_lag_path.exists():
+                raise FileNotFoundError(f"XGBoostLag model not found for {symbol}")
+            xgb_lag = XGBoostLagPredictor()
+            xgb_lag.load(xgb_lag_path)
 
         if "encoder_decoder" in selected_models:
             if not ed_path.exists():
@@ -986,10 +1088,12 @@ class ModelTrainer:
             dqn.load(dqn_path)
 
         ensemble = EnsembleModel(
-            lstm=lstm, xgboost=xgb, encoder_decoder=ed, prophet=prophet,
+            lstm=lstm, xgboost=xgb, xgboost_lag=xgb_lag,
+            encoder_decoder=ed, prophet=prophet,
             tft=tft, qlearning=ql, dqn=dqn,
             lstm_weight=meta.get("lstm_weight"),
             xgboost_weight=meta.get("xgb_weight"),
+            xgboost_lag_weight=meta.get("xgb_lag_weight", 0.0),
             encoder_decoder_weight=meta.get("ed_weight", 0.0),
             prophet_weight=meta.get("prophet_weight", 0.0),
             tft_weight=meta.get("tft_weight", 0.0),
@@ -1010,6 +1114,7 @@ class ModelTrainer:
         symbol: str,
         lstm: LSTMPredictor | None,
         xgb: XGBoostPredictor | None,
+        xgb_lag: XGBoostLagPredictor | None,
         ed: EncoderDecoderPredictor | None,
         prophet: ProphetPredictor | None,
         tft: TFTPredictor | None,
@@ -1020,6 +1125,7 @@ class ModelTrainer:
         feature_names: list[str],
         lstm_weight: float,
         xgb_weight: float,
+        xgb_lag_weight: float,
         ed_weight: float,
         prophet_weight: float,
         tft_weight: float,
@@ -1027,6 +1133,8 @@ class ModelTrainer:
         dqn_weight: float,
         selected_models: list[str],
         input_size: int,
+        lag_scaler: StandardScaler | None = None,
+        lag_feature_names: list[str] | None = None,
         horizon: int = 5,
         use_news: bool = True,
         use_llm: bool = True,
@@ -1038,6 +1146,7 @@ class ModelTrainer:
 
         if lstm    is not None: lstm.save(model_dir / "lstm.pt")
         if xgb     is not None: xgb.save(model_dir / "xgboost.joblib")
+        if xgb_lag is not None: xgb_lag.save(model_dir / "xgboost_lag.joblib")
         if ed      is not None: ed.save(model_dir / "encoder_decoder.pt")
         if prophet is not None: prophet.save(model_dir / "prophet.joblib")
         if tft     is not None: tft.save(model_dir / "tft.pt")
@@ -1046,24 +1155,27 @@ class ModelTrainer:
 
         joblib.dump(
             {
-                "scaler":          scaler,
-                "seq_scaler":      seq_scaler,
-                "feature_names":   feature_names,
-                "input_size":      input_size,
-                "lstm_weight":     lstm_weight,
-                "xgb_weight":      xgb_weight,
-                "ed_weight":       ed_weight,
-                "prophet_weight":  prophet_weight,
-                "tft_weight":      tft_weight,
-                "ql_weight":       ql_weight,
-                "dqn_weight":      dqn_weight,
-                "selected_models": selected_models,
-                "trained_at":      datetime.now().isoformat(),
-                "horizon":         horizon,
-                "use_news":        use_news,
-                "use_llm":         use_llm,
-                "use_financials":  use_financials,
-                "val_accuracy":    val_accuracy,
+                "scaler":             scaler,
+                "seq_scaler":         seq_scaler,
+                "feature_names":      feature_names,
+                "input_size":         input_size,
+                "lstm_weight":        lstm_weight,
+                "xgb_weight":         xgb_weight,
+                "xgb_lag_weight":     xgb_lag_weight,
+                "ed_weight":          ed_weight,
+                "prophet_weight":     prophet_weight,
+                "tft_weight":         tft_weight,
+                "ql_weight":          ql_weight,
+                "dqn_weight":         dqn_weight,
+                "selected_models":    selected_models,
+                "trained_at":         datetime.now().isoformat(),
+                "horizon":            horizon,
+                "use_news":           use_news,
+                "use_llm":            use_llm,
+                "use_financials":     use_financials,
+                "val_accuracy":       val_accuracy,
+                "lag_scaler":         lag_scaler,
+                "lag_feature_names":  lag_feature_names or [],
             },
             model_dir / "meta.joblib",
         )

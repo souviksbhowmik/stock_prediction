@@ -305,6 +305,57 @@ class FeaturePipeline:
         )
         return sequences, tabular, reg_targets, seq_labels, feature_cols
 
+    def prepare_training_data_lag(
+        self,
+        symbol: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Prepare the extended tabular data for XGBoostLag training.
+
+        Builds the standard feature df via ``build_features()``, then applies
+        ``add_lag_trend_features()`` to add 16 additional lag / trend columns.
+        Only the tabular snapshot (one row per timestep) is returned — sequence
+        arrays are not needed because XGBoostLag is a tabular model.
+
+        NaN rows introduced by the lag windows are dropped *after* aligning
+        with the base label array so that row counts match.
+
+        Returns:
+            (tabular_lag, labels, feature_names_lag)
+            - tabular_lag     : (N, n_base + n_lag) float32 array
+            - labels          : (N,) int64 signal array
+            - feature_names_lag: ordered list of column names
+        """
+        from stock_prediction.features.technical import add_lag_trend_features
+
+        df = self.build_features(symbol, start_date, end_date)
+        if df.empty:
+            raise ValueError(
+                "yfinance returned no price data — check ticker format or network"
+            )
+
+        horizon = int(get_setting("features", "prediction_horizon", default=1))
+        label_cols = {"return_1d", "return_5d", f"return_{horizon}d", "signal"}
+
+        # Apply lag/trend features on top of the base df
+        df_lag = add_lag_trend_features(df)
+
+        # Drop any NaN rows introduced by the new lag windows
+        df_lag = df_lag.dropna()
+
+        feature_cols_lag = [c for c in df_lag.columns if c not in label_cols]
+        tabular_lag = df_lag[feature_cols_lag].values.astype(np.float32)
+        labels      = df_lag["signal"].values.astype(np.int64)
+
+        tabular_lag = np.nan_to_num(tabular_lag, nan=0.0, posinf=0.0, neginf=0.0)
+
+        logger.info(
+            f"Prepared lag tabular data for {symbol}: "
+            f"shape={tabular_lag.shape}, n_lag_features={len(feature_cols_lag)}"
+        )
+        return tabular_lag, labels, feature_cols_lag
+
     def prepare_prophet_data(
         self,
         symbol: str,

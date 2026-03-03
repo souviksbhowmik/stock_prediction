@@ -11,6 +11,33 @@ from stock_prediction.utils.logging import setup_logging
 console = Console()
 
 
+def _build_x_tab_lag(df, meta):
+    """Build and scale the lag-feature row for xgboost_lag inference.
+
+    Returns a (1, n_lag_features) float32 array, or None if xgboost_lag
+    is not part of the loaded ensemble.
+    """
+    if "xgboost_lag" not in meta.get("selected_models", []):
+        return None
+    lag_scaler = meta.get("lag_scaler")
+    lag_feature_names = meta.get("lag_feature_names", [])
+    if lag_scaler is None or not lag_feature_names:
+        return None
+    try:
+        from stock_prediction.features.technical import add_lag_trend_features
+        import numpy as np
+        lag_df = add_lag_trend_features(df).dropna()
+        if lag_df.empty:
+            return None
+        available = [c for c in lag_feature_names if c in lag_df.columns]
+        if not available:
+            return None
+        latest_lag = lag_df[available].values[-1]
+        return lag_scaler.transform(latest_lag.reshape(1, -1)).astype(np.float32)
+    except Exception:
+        return None
+
+
 @click.group()
 @click.option("--log-level", default="INFO", help="Logging level")
 def cli(log_level: str):
@@ -116,7 +143,7 @@ def predict(symbols: str | None, export: bool, no_news: bool, no_llm: bool):
     signals = []
     for symbol in symbol_list:
         try:
-            ensemble, scaler, seq_scaler, model_age_days = trainer.load_models(symbol)
+            ensemble, scaler, seq_scaler, model_age_days, meta = trainer.load_models(symbol)
             if model_age_days is not None and model_age_days > staleness_threshold:
                 console.print(f"[yellow]Warning: Model for {symbol} is {model_age_days} days old. Consider retraining.[/]")
             pipeline = FeaturePipeline(use_news=use_news, use_llm=use_llm)
@@ -144,10 +171,14 @@ def predict(symbols: str | None, export: bool, no_news: bool, no_llm: bool):
             ).reshape(1, seq_len, n_feat)
             latest_tab_scaled = scaler.transform(latest_tab.reshape(1, -1))
 
+            # Build lag features for xgboost_lag (if trained)
+            x_tab_lag = _build_x_tab_lag(df, meta)
+
             # Predict
             prediction = ensemble.predict_single(
                 latest_seq_scaled.astype(np.float32),
                 latest_tab_scaled.astype(np.float32),
+                X_tab_lag=x_tab_lag,
             )
 
             # Technical data for signal generator
@@ -224,7 +255,7 @@ def analyze(symbol: str, no_news: bool, no_llm: bool):
     signal = None
     try:
         trainer = ModelTrainer()
-        ensemble, scaler, seq_scaler, model_age_days = trainer.load_models(symbol)
+        ensemble, scaler, seq_scaler, model_age_days, meta = trainer.load_models(symbol)
         staleness_threshold = get_setting("models", "staleness_warning_days", default=30)
         if model_age_days is not None and model_age_days > staleness_threshold:
             console.print(f"[yellow]Warning: Model for {symbol} is {model_age_days} days old. Consider retraining.[/]")
@@ -246,9 +277,11 @@ def analyze(symbol: str, no_news: bool, no_llm: bool):
                 ).reshape(1, seq_len, n_feat)
                 latest_tab_scaled = scaler.transform(latest_tab.reshape(1, -1))
 
+                x_tab_lag = _build_x_tab_lag(df, meta)
                 prediction = ensemble.predict_single(
                     latest_seq_scaled.astype(np.float32),
                     latest_tab_scaled.astype(np.float32),
+                    X_tab_lag=x_tab_lag,
                 )
 
                 tech_cols = ["RSI", "MACD_Histogram", "Price_SMA50_Ratio"]
@@ -532,7 +565,7 @@ def lookup(query: str):
     csv_rows = []
     for symbol, name in sorted(matched.items()):
         try:
-            ensemble, scaler, seq_scaler, model_age_days = trainer.load_models(symbol)
+            ensemble, scaler, seq_scaler, model_age_days, meta = trainer.load_models(symbol)
             pipeline = FeaturePipeline(use_news=False, use_llm=False)
             df = pipeline.build_features(symbol)
 
@@ -553,9 +586,11 @@ def lookup(query: str):
             ).reshape(1, seq_len, n_feat)
             latest_tab_scaled = scaler.transform(latest_tab.reshape(1, -1))
 
+            x_tab_lag = _build_x_tab_lag(df, meta)
             prediction = ensemble.predict_single(
                 latest_seq_scaled.astype(np.float32),
                 latest_tab_scaled.astype(np.float32),
+                X_tab_lag=x_tab_lag,
             )
 
             tech_cols = ["RSI", "MACD_Histogram", "Price_SMA50_Ratio"]

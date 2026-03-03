@@ -1,4 +1,4 @@
-"""Weighted ensemble of LSTM, XGBoost, Encoder-Decoder, Prophet, TFT, and Q-learning models."""
+"""Weighted ensemble of LSTM, XGBoost, XGBoostLag, Encoder-Decoder, Prophet, TFT, and Q-learning models."""
 
 from __future__ import annotations
 
@@ -62,6 +62,9 @@ class EnsemblePrediction:
     dqn_probs: dict[str, float] = field(
         default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
     )
+    xgboost_lag_probs: dict[str, float] = field(
+        default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
+    )
 
 
 class EnsembleModel:
@@ -90,6 +93,7 @@ class EnsembleModel:
         tft=None,
         qlearning=None,
         dqn=None,
+        xgboost_lag=None,
         lstm_weight: float | None = None,
         xgboost_weight: float | None = None,
         encoder_decoder_weight: float | None = None,
@@ -97,13 +101,14 @@ class EnsembleModel:
         tft_weight: float | None = None,
         qlearning_weight: float | None = None,
         dqn_weight: float | None = None,
+        xgboost_lag_weight: float | None = None,
     ):
         if (lstm is None and xgboost is None and encoder_decoder is None
                 and prophet is None and tft is None and qlearning is None
-                and dqn is None):
+                and dqn is None and xgboost_lag is None):
             raise ValueError(
-                "At least one of lstm / xgboost / encoder_decoder / prophet / tft / "
-                "qlearning / dqn must be provided"
+                "At least one of lstm / xgboost / xgboost_lag / encoder_decoder / "
+                "prophet / tft / qlearning / dqn must be provided"
             )
 
         self.lstm = lstm
@@ -113,6 +118,7 @@ class EnsembleModel:
         self.tft = tft
         self.qlearning = qlearning
         self.dqn = dqn
+        self.xgboost_lag = xgboost_lag
 
         self.lstm_weight = lstm_weight if lstm_weight is not None else (
             get_setting("models", "ensemble", "lstm_weight", default=0.4)
@@ -125,25 +131,34 @@ class EnsembleModel:
         self.tft_weight = tft_weight if tft_weight is not None else 0.0
         self.qlearning_weight = qlearning_weight if qlearning_weight is not None else 0.0
         self.dqn_weight = dqn_weight if dqn_weight is not None else 0.0
+        self.xgboost_lag_weight = xgboost_lag_weight if xgboost_lag_weight is not None else 0.0
 
     def predict(
-        self, X_seq: np.ndarray | None, X_tab: np.ndarray | None
+        self,
+        X_seq: np.ndarray | None,
+        X_tab: np.ndarray | None,
+        X_tab_lag: np.ndarray | None = None,
     ) -> list[EnsemblePrediction]:
         """Generate predictions for N samples.
 
         Args:
-            X_seq: (N, seq_len, n_features) — used by lstm, encoder_decoder, and tft.
-                   May be None if none of those models are active.
-            X_tab: (N, n_features) — used by xgboost.
-                   May be None if xgboost is not active.
+            X_seq:     (N, seq_len, n_features) — used by lstm, encoder_decoder, tft.
+                       May be None if none of those models are active.
+            X_tab:     (N, n_features) — used by xgboost.
+                       May be None if xgboost is not active.
+            X_tab_lag: (N, n_features + n_lag) — used by xgboost_lag.
+                       Scaled with lag_scaler (separate from the standard scaler).
+                       May be None if xgboost_lag is not active.
         """
         # Determine N
         if X_seq is not None:
             N = X_seq.shape[0]
         elif X_tab is not None:
             N = X_tab.shape[0]
+        elif X_tab_lag is not None:
+            N = X_tab_lag.shape[0]
         else:
-            raise ValueError("X_seq and X_tab cannot both be None")
+            raise ValueError("X_seq, X_tab, and X_tab_lag cannot all be None")
 
         zeros = np.zeros((N, 3), dtype=np.float32)
 
@@ -151,13 +166,14 @@ class EnsembleModel:
         weighted_sum = np.zeros((N, 3), dtype=np.float32)
         total_weight = 0.0
 
-        lstm_probs    = zeros.copy()
-        xgb_probs     = zeros.copy()
-        ed_probs      = zeros.copy()
-        prophet_probs = zeros.copy()
-        tft_probs     = zeros.copy()
-        ql_probs      = zeros.copy()
-        dqn_probs     = zeros.copy()
+        lstm_probs        = zeros.copy()
+        xgb_probs         = zeros.copy()
+        ed_probs          = zeros.copy()
+        prophet_probs     = zeros.copy()
+        tft_probs         = zeros.copy()
+        ql_probs          = zeros.copy()
+        dqn_probs         = zeros.copy()
+        xgb_lag_probs     = zeros.copy()
 
         if self.lstm is not None and X_seq is not None:
             lstm_probs = self.lstm.predict_proba(X_seq)
@@ -185,16 +201,19 @@ class EnsembleModel:
             total_weight += self.tft_weight
 
         if self.qlearning is not None and X_seq is not None:
-            # Q-learning uses last timestep of the sequence for state lookup
             ql_probs = self.qlearning.predict_proba(X_seq)
             weighted_sum += self.qlearning_weight * ql_probs
             total_weight += self.qlearning_weight
 
         if self.dqn is not None and X_seq is not None:
-            # DQN uses last timestep of the sequence as continuous state
             dqn_probs = self.dqn.predict_proba(X_seq)
             weighted_sum += self.dqn_weight * dqn_probs
             total_weight += self.dqn_weight
+
+        if self.xgboost_lag is not None and X_tab_lag is not None:
+            xgb_lag_probs = self.xgboost_lag.predict_proba(X_tab_lag)
+            weighted_sum += self.xgboost_lag_weight * xgb_lag_probs
+            total_weight += self.xgboost_lag_weight
 
         ensemble_probs = weighted_sum / max(total_weight, 1e-8)
 
@@ -247,17 +266,27 @@ class EnsembleModel:
                         "HOLD": float(dqn_probs[i][1]),
                         "BUY":  float(dqn_probs[i][2]),
                     },
+                    xgboost_lag_probs={
+                        "SELL": float(xgb_lag_probs[i][0]),
+                        "HOLD": float(xgb_lag_probs[i][1]),
+                        "BUY":  float(xgb_lag_probs[i][2]),
+                    },
                 )
             )
 
         return predictions
 
     def predict_single(
-        self, X_seq: np.ndarray | None, X_tab: np.ndarray | None
+        self,
+        X_seq: np.ndarray | None,
+        X_tab: np.ndarray | None,
+        X_tab_lag: np.ndarray | None = None,
     ) -> EnsemblePrediction:
         """Predict for a single sample."""
         if X_seq is not None and X_seq.ndim == 2:
             X_seq = X_seq[np.newaxis, ...]
         if X_tab is not None and X_tab.ndim == 1:
             X_tab = X_tab[np.newaxis, ...]
-        return self.predict(X_seq, X_tab)[0]
+        if X_tab_lag is not None and X_tab_lag.ndim == 1:
+            X_tab_lag = X_tab_lag[np.newaxis, ...]
+        return self.predict(X_seq, X_tab, X_tab_lag)[0]

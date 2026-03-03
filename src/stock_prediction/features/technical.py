@@ -1,5 +1,6 @@
 """Technical indicators using the ta library."""
 
+import numpy as np
 import pandas as pd
 import ta
 
@@ -111,4 +112,93 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Stoch_K_Change_1d"] = df["Stoch_K"].diff(1)
 
     logger.info(f"Added {len(df.columns) - 5} technical indicators")
+    return df
+
+
+def add_lag_trend_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add lag and explicit trend-direction features for XGBoostLag.
+
+    Expects the df to already have base technical indicators applied
+    (Open, High, Low, Close, Volume, RSI, EMA_12, EMA_26, MACD_Histogram,
+    Volume_Ratio).
+
+    Adds 16 new columns grouped into four categories:
+
+    Lagged close ratios (3)
+        Close_Lag1_Ratio / Close_Lag3_Ratio / Close_Lag5_Ratio
+        = Close[t] / Close[t-k].  Values > 1 indicate an uptrend over k days.
+
+    Lagged indicator snapshots (4)
+        RSI_Lag3 / RSI_Lag5 / MACD_Hist_Lag3 / Volume_Ratio_Lag3
+        Actual past values of key indicators (not just their diffs).
+
+    Trend direction (5)
+        ADX / ADX_Pos / ADX_Neg        — trend strength + directional movement
+        ADX_Cross                       — 1 if +DI > -DI (bullish trend)
+        EMA_12_26_Cross                 — 1 if EMA12 > EMA26 (golden cross)
+
+    Trend slope (2)
+        Trend_Slope_10d / Trend_Slope_20d
+        Normalised linear-regression slope of Close over the last N days.
+        Positive = upward slope; negative = downward slope.
+
+    Price position in recent range (2)
+        Price_Rank_10d / Price_Rank_20d
+        (Close - rolling_min) / (rolling_max - rolling_min) in [0, 1].
+        Values near 1 = near recent high; near 0 = near recent low.
+    """
+    df = df.copy()
+
+    # ── Lagged close ratios ───────────────────────────────────────────────────
+    for k in (1, 3, 5):
+        shifted = df["Close"].shift(k)
+        df[f"Close_Lag{k}_Ratio"] = df["Close"] / shifted.replace(0, float("nan"))
+
+    # ── Lagged indicator snapshots ────────────────────────────────────────────
+    if "RSI" in df.columns:
+        df["RSI_Lag3"] = df["RSI"].shift(3)
+        df["RSI_Lag5"] = df["RSI"].shift(5)
+    if "MACD_Histogram" in df.columns:
+        df["MACD_Hist_Lag3"] = df["MACD_Histogram"].shift(3)
+    if "Volume_Ratio" in df.columns:
+        df["Volume_Ratio_Lag3"] = df["Volume_Ratio"].shift(3)
+
+    # ── ADX — trend strength and direction ────────────────────────────────────
+    adx_period = get_setting("features", "technical", "adx_period", default=14)
+    adx_ind = ta.trend.ADXIndicator(
+        high=df["High"], low=df["Low"], close=df["Close"], window=adx_period
+    )
+    df["ADX"]      = adx_ind.adx()
+    df["ADX_Pos"]  = adx_ind.adx_pos()   # +DI: bullish directional movement
+    df["ADX_Neg"]  = adx_ind.adx_neg()   # -DI: bearish directional movement
+    df["ADX_Cross"] = (df["ADX_Pos"] > df["ADX_Neg"]).astype(int)
+
+    # ── EMA crossover flag ────────────────────────────────────────────────────
+    if "EMA_12" in df.columns and "EMA_26" in df.columns:
+        df["EMA_12_26_Cross"] = (df["EMA_12"] > df["EMA_26"]).astype(int)
+
+    # ── Normalised linear-regression slope ───────────────────────────────────
+    def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
+        """Slope of OLS fit over `window` days, normalised by mean price."""
+        x = np.arange(window, dtype=np.float64)
+
+        def _slope(y: np.ndarray) -> float:
+            mean = y.mean()
+            if mean == 0:
+                return 0.0
+            return float(np.polyfit(x, y, 1)[0] / mean)
+
+        return series.rolling(window).apply(_slope, raw=True)
+
+    df["Trend_Slope_10d"] = _rolling_slope(df["Close"], 10)
+    df["Trend_Slope_20d"] = _rolling_slope(df["Close"], 20)
+
+    # ── Price position within recent range ───────────────────────────────────
+    for w in (10, 20):
+        lo = df["Close"].rolling(w).min()
+        hi = df["Close"].rolling(w).max()
+        rng = (hi - lo).replace(0, float("nan"))
+        df[f"Price_Rank_{w}d"] = (df["Close"] - lo) / rng
+
+    logger.info(f"Added {16} lag/trend features (xgboost_lag)")
     return df
