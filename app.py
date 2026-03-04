@@ -1976,6 +1976,166 @@ def page_settings() -> None:
             st.rerun()
 
 
+# ─── Model Catalogue ──────────────────────────────────────────────────────────
+def page_catalogue() -> None:
+    from pathlib import Path
+    from stock_prediction.config import get_setting
+    from stock_prediction.models.trainer import list_trained_models
+
+    st.title("📚 Model Catalogue")
+    st.caption("Browse all trained models. Select a symbol to see full details.")
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+
+    WEIGHT_KEYS = {
+        "lstm":            "lstm_weight",
+        "xgboost":         "xgb_weight",
+        "xgboost_lag":     "xgb_lag_weight",
+        "encoder_decoder": "ed_weight",
+        "prophet":         "prophet_weight",
+        "tft":             "tft_weight",
+        "qlearning":       "ql_weight",
+        "dqn":             "dqn_weight",
+        "dqn_lag":         "dqn_lag_weight",
+    }
+
+    all_models = list_trained_models(save_dir)
+
+    if not all_models:
+        st.warning(f"No trained models found in `{save_dir}`. Run **Train** first.")
+        return
+
+    # ── Symbol search / filter ───────────────────────────────────────────────
+    search = st.text_input("🔍 Filter by symbol", placeholder="e.g. INFY or leave blank for all")
+    filtered = [m for m in all_models
+                if not search or search.upper() in m["symbol"].upper()]
+
+    if not filtered:
+        st.info(f"No models match '{search}'.")
+        return
+
+    # ── Summary table ────────────────────────────────────────────────────────
+    st.subheader(f"All Trained Models ({len(filtered)} of {len(all_models)})")
+
+    def _ck(v: bool) -> str:
+        return "✓" if v else "✗"
+
+    rows = [
+        {
+            "Symbol":     m["symbol"],
+            "Algorithms": ", ".join(m.get("selected_models") or []) or "—",
+            "Val Acc":    f"{m['val_accuracy']:.1%}" if m.get("val_accuracy") is not None else "—",
+            "Horizon":    f"{m.get('horizon', '—')}d",
+            "Trained At": (m.get("trained_at") or "")[:10] or "—",
+            "Age":        f"{m['model_age_days']}d" if m.get("model_age_days") is not None else "—",
+            "News":       _ck(m.get("use_news", False)),
+            "LLM":        _ck(m.get("use_llm", False)),
+            "Fin":        _ck(m.get("use_financials", False)),
+            "Files":      str(len(m.get("model_files", {}))),
+        }
+        for m in filtered
+    ]
+
+    def _color_ck(val: str) -> str:
+        if val == "✓": return "color:#16a34a; font-weight:700"
+        if val == "✗": return "color:#dc2626"
+        return ""
+
+    def _color_age(val: str) -> str:
+        try:
+            d = int(val.replace("d", ""))
+            if d > 30: return "color:#d97706; font-weight:600"
+            if d > 7:  return "color:#ca8a04"
+        except Exception:
+            pass
+        return ""
+
+    _show_table(
+        pd.DataFrame(rows),
+        style_map={
+            "News": _color_ck,
+            "LLM":  _color_ck,
+            "Fin":  _color_ck,
+            "Age":  _color_age,
+        },
+    )
+
+    st.divider()
+
+    # ── Detail panel ─────────────────────────────────────────────────────────
+    st.subheader("Symbol Detail")
+    symbol_options = [m["symbol"] for m in filtered]
+    selected = st.selectbox("Select a symbol to inspect", options=symbol_options, key="cat_symbol")
+
+    entry = next((m for m in filtered if m["symbol"] == selected), None)
+    if entry is None:
+        return
+
+    sel      = entry.get("selected_models") or []
+    acc      = entry.get("val_accuracy")
+    trained  = (entry.get("trained_at") or "")[:19].replace("T", " ")
+    horizon  = entry.get("horizon", "—")
+    age      = entry.get("model_age_days")
+    use_news = entry.get("use_news", False)
+    use_llm  = entry.get("use_llm", False)
+    use_fin  = entry.get("use_financials", False)
+    in_sz    = entry.get("input_size", 0)
+    lag_sz   = entry.get("lag_input_size", 0)
+    feat_n   = len(entry.get("feature_names") or [])
+    lag_feat = len(entry.get("lag_feature_names") or [])
+    files    = entry.get("model_files", {})
+
+    # ── Key metrics row ───────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Val Accuracy", f"{acc:.1%}" if acc is not None else "—")
+    c2.metric("Horizon", f"{horizon}d")
+    c3.metric("Trained At", trained[:10] if trained else "—")
+    c4.metric("Model Age", f"{age} days" if age is not None else "—",
+              delta="stale" if (age or 0) > 30 else None,
+              delta_color="inverse")
+    c5.metric("Model Files", len(files))
+
+    # ── Feature flags ─────────────────────────────────────────────────────────
+    st.markdown("**Feature Flags**")
+    fc1, fc2, fc3 = st.columns(3)
+    fc1.metric("News Sentiment", "✓ Enabled" if use_news else "✗ Disabled")
+    fc2.metric("LLM Broker Scores", "✓ Enabled" if use_llm else "✗ Disabled")
+    fc3.metric("Quarterly Financials", "✓ Enabled" if use_fin else "✗ Disabled")
+
+    # ── Input dimensions ──────────────────────────────────────────────────────
+    st.markdown("**Input Dimensions**")
+    dc1, dc2, dc3, dc4 = st.columns(4)
+    dc1.metric("Standard Input Size", in_sz or "—")
+    dc2.metric("Lag Input Size", lag_sz or "—")
+    dc3.metric("Standard Features", feat_n or "—")
+    dc4.metric("Lag Features", lag_feat or "—")
+
+    # ── Ensemble weights ──────────────────────────────────────────────────────
+    if sel:
+        st.markdown("**Ensemble Weights**")
+        wt_rows = []
+        for m in sel:
+            w = entry.get(WEIGHT_KEYS.get(m, ""), None)
+            wt_rows.append({
+                "Model":  m,
+                "Weight": f"{w:.4f}" if w is not None else "—",
+                "Bar":    f"{(w or 0)*100:.1f}%",
+            })
+        _show_table(pd.DataFrame(wt_rows))
+
+    # ── Model files ───────────────────────────────────────────────────────────
+    if files:
+        st.markdown("**Model Files on Disk**")
+        file_rows = [
+            {"File": fname, "Size": f"{sz/1024:.1f} KB"}
+            for fname, sz in sorted(files.items())
+        ]
+        _show_table(pd.DataFrame(file_rows))
+
+    # ── Model directory path ──────────────────────────────────────────────────
+    st.caption(f"📁 Model directory: `{entry['model_dir']}`")
+
+
 # ─── Router ───────────────────────────────────────────────────────────────────
 PAGE_MAP = {
     "📊 Suggest (deprecated)": page_suggest,
@@ -1987,6 +2147,7 @@ PAGE_MAP = {
     "🔮 Predict":    page_predict,
     "🔬 Analyze":    page_analyze,
     "📡 Screen":     page_screen,
+    "📚 Model Catalogue": page_catalogue,
     "💰 Trade":      page_trade,
     "💼 Portfolio":  page_portfolio,
     "📈 Gain Report": page_gain_report,

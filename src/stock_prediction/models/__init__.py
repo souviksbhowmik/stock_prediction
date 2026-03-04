@@ -5,6 +5,7 @@ from stock_prediction.models.trainer import (
     ModelTrainer,
     AVAILABLE_MODELS,
     list_experiments,
+    list_trained_models,
     promote_experiment,
 )
 from stock_prediction.models.encoder_decoder_model import EncoderDecoderPredictor
@@ -17,6 +18,7 @@ __all__ = [
     "ModelTrainer",
     "AVAILABLE_MODELS",
     "list_experiments",
+    "list_trained_models",
     "promote_experiment",
     "EncoderDecoderPredictor",
     "ProphetPredictor",

@@ -106,6 +106,67 @@ _DQN_PARAM_GRID: list[dict] = [
 ]
 
 
+def list_trained_models(save_dir: Path) -> list[dict]:
+    """Scan save_dir and return a summary dict for every trained symbol.
+
+    Each dict contains the symbol name and all meta.joblib fields, plus:
+      ``model_dir``   — Path to the symbol's model directory
+      ``model_age_days`` — Days since training (None if unknown)
+      ``model_files`` — {filename: size_bytes} for every model file present
+    """
+    import re
+    results: list[dict] = []
+    if not save_dir.exists():
+        return results
+
+    MODEL_FILES = [
+        "lstm.pt", "xgboost.joblib", "xgboost_lag.joblib",
+        "encoder_decoder.pt", "prophet.joblib", "tft.pt",
+        "qlearning.joblib", "dqn.pt", "dqn_lag.pt",
+    ]
+
+    for sym_dir in sorted(save_dir.iterdir()):
+        if not sym_dir.is_dir():
+            continue
+        # Skip the experimental sub-tree itself
+        if sym_dir.name == "experimental":
+            continue
+        meta_path = sym_dir / "meta.joblib"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = joblib.load(meta_path)
+        except Exception:
+            continue
+
+        # Reverse symbol.replace(".", "_"): restore last _XX suffix to .XX
+        symbol = re.sub(r"_([A-Z]{2,3})$", r".\1", sym_dir.name)
+
+        trained_at = meta.get("trained_at")
+        model_age_days = None
+        if trained_at:
+            try:
+                model_age_days = (datetime.now() - datetime.fromisoformat(trained_at)).days
+            except Exception:
+                pass
+
+        model_files = {
+            f: sym_dir / f
+            for f in MODEL_FILES
+            if (sym_dir / f).exists()
+        }
+
+        results.append({
+            "symbol": symbol,
+            "model_dir": sym_dir,
+            "model_age_days": model_age_days,
+            "model_files": {f: p.stat().st_size for f, p in model_files.items()},
+            **meta,
+        })
+
+    return results
+
+
 def list_experiments(symbol: str, save_dir: Path) -> list[dict]:
     """Return metadata for all experimental runs for a symbol, newest first."""
     exp_root = save_dir / symbol.replace(".", "_") / "experimental"

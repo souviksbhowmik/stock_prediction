@@ -834,5 +834,142 @@ def model_info(symbol: str):
     console.print(table)
 
 
+@cli.command("catalogue")
+@click.option("--symbol", "-s", default=None,
+              help="Symbol to inspect in detail. Omit to list all trained models.")
+def catalogue(symbol: str | None):
+    """Browse all trained models or inspect one in full detail.
+
+    \b
+    Examples:
+      stockpredict catalogue              # summary table of all trained models
+      stockpredict catalogue -s INFY.NS   # full detail for INFY.NS
+    """
+    from rich.table import Table
+    from rich.text import Text
+    from stock_prediction.models.trainer import list_trained_models
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+
+    WEIGHT_KEYS = {
+        "lstm":            "lstm_weight",
+        "xgboost":         "xgb_weight",
+        "xgboost_lag":     "xgb_lag_weight",
+        "encoder_decoder": "ed_weight",
+        "prophet":         "prophet_weight",
+        "tft":             "tft_weight",
+        "qlearning":       "ql_weight",
+        "dqn":             "dqn_weight",
+        "dqn_lag":         "dqn_lag_weight",
+    }
+
+    all_models = list_trained_models(save_dir)
+
+    if not all_models:
+        console.print("[yellow]No trained models found in[/yellow]", str(save_dir))
+        return
+
+    if symbol:
+        # ── Detail view for one symbol ───────────────────────────────────────
+        sym_key = symbol.replace(".", "_")
+        entry = next((m for m in all_models if m["model_dir"].name == sym_key), None)
+        if entry is None:
+            console.print(f"[yellow]No trained model found for {symbol}.[/yellow]")
+            return
+
+        meta = entry
+        sel      = meta.get("selected_models") or []
+        acc      = meta.get("val_accuracy")
+        trained  = (meta.get("trained_at") or "")[:16].replace("T", " ")
+        horizon  = meta.get("horizon", "—")
+        use_news = meta.get("use_news", False)
+        use_llm  = meta.get("use_llm", False)
+        use_fin  = meta.get("use_financials", False)
+        age      = meta.get("model_age_days")
+        in_sz    = meta.get("input_size", 0)
+        lag_sz   = meta.get("lag_input_size", 0)
+        feat_n   = len(meta.get("feature_names") or [])
+        lag_feat = len(meta.get("lag_feature_names") or [])
+
+        # ── Overview ─────────────────────────────────────────────────────────
+        info = Table(title=f"📚 Model — {symbol}", show_header=False, box=None, padding=(0, 2))
+        info.add_column("Field", style="bold cyan", no_wrap=True)
+        info.add_column("Value")
+
+        ck = lambda v: Text("✓", style="green") if v else Text("✗", style="red")
+        info.add_row("Algorithms",    ", ".join(sel) if sel else "—")
+        info.add_row("Val Accuracy",  f"{acc:.1%}" if acc is not None else "—")
+        info.add_row("Horizon",       f"{horizon} day{'s' if horizon != 1 else ''}")
+        info.add_row("Trained At",    trained or "—")
+        info.add_row("Model Age",     f"{age} days" if age is not None else "—")
+        info.add_row("News features", ck(use_news))
+        info.add_row("LLM features",  ck(use_llm))
+        info.add_row("Financials",    ck(use_fin))
+        info.add_row("Input size",    f"{in_sz} features" if in_sz else "—")
+        info.add_row("Lag input size",f"{lag_sz} features" if lag_sz else "—")
+        info.add_row("Feature names", f"{feat_n} columns" if feat_n else "—")
+        info.add_row("Lag features",  f"{lag_feat} columns" if lag_feat else "—")
+        info.add_row("Model path",    str(meta["model_dir"]))
+        console.print(info)
+
+        # ── Ensemble weights ──────────────────────────────────────────────────
+        if sel:
+            wt = Table(title="Ensemble Weights", box=None, padding=(0, 2))
+            wt.add_column("Model",  style="bold")
+            wt.add_column("Weight", justify="right")
+            for m in sel:
+                w = meta.get(WEIGHT_KEYS.get(m, ""), None)
+                wt.add_row(m, f"{w:.4f}" if w is not None else "—")
+            console.print(wt)
+
+        # ── Model files ───────────────────────────────────────────────────────
+        files = meta.get("model_files", {})
+        if files:
+            ft = Table(title="Model Files on Disk", box=None, padding=(0, 2))
+            ft.add_column("File", style="bold")
+            ft.add_column("Size", justify="right")
+            for fname, sz in sorted(files.items()):
+                ft.add_row(fname, f"{sz/1024:.1f} KB")
+            console.print(ft)
+
+    else:
+        # ── Summary table — all symbols ───────────────────────────────────────
+        tbl = Table(title="📚 Trained Model Catalogue", box=None, padding=(0, 2))
+        tbl.add_column("Symbol",     style="bold cyan")
+        tbl.add_column("Algorithms")
+        tbl.add_column("Val Acc",    justify="right")
+        tbl.add_column("Horizon",    justify="center")
+        tbl.add_column("Trained At")
+        tbl.add_column("Age",        justify="right")
+        tbl.add_column("News",       justify="center")
+        tbl.add_column("LLM",        justify="center")
+        tbl.add_column("Fin",        justify="center")
+
+        ck = lambda v: Text("✓", style="green") if v else Text("✗", style="red")
+        for entry in all_models:
+            sel     = entry.get("selected_models") or []
+            acc     = entry.get("val_accuracy")
+            trained = (entry.get("trained_at") or "")[:10]
+            horizon = entry.get("horizon", "—")
+            age     = entry.get("model_age_days")
+            tbl.add_row(
+                entry["symbol"],
+                ", ".join(sel) if sel else "—",
+                f"{acc:.1%}" if acc is not None else "—",
+                str(horizon),
+                trained or "—",
+                f"{age}d" if age is not None else "—",
+                ck(entry.get("use_news", False)),
+                ck(entry.get("use_llm", False)),
+                ck(entry.get("use_financials", False)),
+            )
+
+        console.print(tbl)
+        console.print(
+            f"\n[dim]{len(all_models)} model(s) found. "
+            "Run [bold]stockpredict catalogue -s SYMBOL[/bold] for full detail.[/dim]"
+        )
+
+
 if __name__ == "__main__":
     cli()
