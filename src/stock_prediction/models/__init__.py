@@ -9,6 +9,7 @@ from stock_prediction.models.trainer import (
 )
 from stock_prediction.models.encoder_decoder_model import EncoderDecoderPredictor
 from stock_prediction.models.prophet_model import ProphetPredictor
+from stock_prediction.models.dqn_lag_model import DQNLagPredictor
 
 __all__ = [
     "EnsembleModel",
@@ -19,4 +20,5 @@ __all__ = [
     "promote_experiment",
     "EncoderDecoderPredictor",
     "ProphetPredictor",
+    "DQNLagPredictor",
 ]

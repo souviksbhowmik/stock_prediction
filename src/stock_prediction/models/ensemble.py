@@ -36,6 +36,10 @@ def _get_dqn_type():
     from stock_prediction.models.dqn_model import DQNPredictor
     return DQNPredictor
 
+def _get_dqn_lag_type():
+    from stock_prediction.models.dqn_lag_model import DQNLagPredictor
+    return DQNLagPredictor
+
 
 @dataclass
 class EnsemblePrediction:
@@ -63,6 +67,9 @@ class EnsemblePrediction:
         default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
     )
     xgboost_lag_probs: dict[str, float] = field(
+        default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
+    )
+    dqn_lag_probs: dict[str, float] = field(
         default_factory=lambda: {"SELL": 0.0, "HOLD": 0.0, "BUY": 0.0}
     )
 
@@ -94,6 +101,7 @@ class EnsembleModel:
         qlearning=None,
         dqn=None,
         xgboost_lag=None,
+        dqn_lag=None,
         lstm_weight: float | None = None,
         xgboost_weight: float | None = None,
         encoder_decoder_weight: float | None = None,
@@ -102,13 +110,14 @@ class EnsembleModel:
         qlearning_weight: float | None = None,
         dqn_weight: float | None = None,
         xgboost_lag_weight: float | None = None,
+        dqn_lag_weight: float | None = None,
     ):
         if (lstm is None and xgboost is None and encoder_decoder is None
                 and prophet is None and tft is None and qlearning is None
-                and dqn is None and xgboost_lag is None):
+                and dqn is None and xgboost_lag is None and dqn_lag is None):
             raise ValueError(
-                "At least one of lstm / xgboost / xgboost_lag / encoder_decoder / "
-                "prophet / tft / qlearning / dqn must be provided"
+                "At least one of lstm / xgboost / xgboost_lag / dqn_lag / "
+                "encoder_decoder / prophet / tft / qlearning / dqn must be provided"
             )
 
         self.lstm = lstm
@@ -119,6 +128,7 @@ class EnsembleModel:
         self.qlearning = qlearning
         self.dqn = dqn
         self.xgboost_lag = xgboost_lag
+        self.dqn_lag = dqn_lag
 
         self.lstm_weight = lstm_weight if lstm_weight is not None else (
             get_setting("models", "ensemble", "lstm_weight", default=0.4)
@@ -132,6 +142,7 @@ class EnsembleModel:
         self.qlearning_weight = qlearning_weight if qlearning_weight is not None else 0.0
         self.dqn_weight = dqn_weight if dqn_weight is not None else 0.0
         self.xgboost_lag_weight = xgboost_lag_weight if xgboost_lag_weight is not None else 0.0
+        self.dqn_lag_weight = dqn_lag_weight if dqn_lag_weight is not None else 0.0
 
     def predict(
         self,
@@ -174,6 +185,7 @@ class EnsembleModel:
         ql_probs          = zeros.copy()
         dqn_probs         = zeros.copy()
         xgb_lag_probs     = zeros.copy()
+        dqn_lag_probs     = zeros.copy()
 
         if self.lstm is not None and X_seq is not None:
             lstm_probs = self.lstm.predict_proba(X_seq)
@@ -214,6 +226,11 @@ class EnsembleModel:
             xgb_lag_probs = self.xgboost_lag.predict_proba(X_tab_lag)
             weighted_sum += self.xgboost_lag_weight * xgb_lag_probs
             total_weight += self.xgboost_lag_weight
+
+        if self.dqn_lag is not None and X_tab_lag is not None:
+            dqn_lag_probs = self.dqn_lag.predict_proba(X_tab_lag)
+            weighted_sum += self.dqn_lag_weight * dqn_lag_probs
+            total_weight += self.dqn_lag_weight
 
         ensemble_probs = weighted_sum / max(total_weight, 1e-8)
 
@@ -270,6 +287,11 @@ class EnsembleModel:
                         "SELL": float(xgb_lag_probs[i][0]),
                         "HOLD": float(xgb_lag_probs[i][1]),
                         "BUY":  float(xgb_lag_probs[i][2]),
+                    },
+                    dqn_lag_probs={
+                        "SELL": float(dqn_lag_probs[i][0]),
+                        "HOLD": float(dqn_lag_probs[i][1]),
+                        "BUY":  float(dqn_lag_probs[i][2]),
                     },
                 )
             )
