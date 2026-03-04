@@ -77,13 +77,22 @@ _TFT_PARAM_GRID: list[dict] = [
     {"hidden_size": 128, "num_heads": 8, "dropout": 0.2, "learning_rate": 0.001},
 ]
 
-# DQN grid: vary network width, dropout, and learning rate
+# DQN grid: 2 baseline configs (no encoder) + 3 GRU-encoder configs.
+# The encoder compresses the full 60-step sequence into a context vector,
+# eliminating state aliasing caused by using only the last timestep.
 _DQN_PARAM_GRID: list[dict] = [
-    {"hidden_sizes": [128, 64],   "dropout": 0.2, "learning_rate": 0.001,  "n_episodes": 10},
-    {"hidden_sizes": [256, 128],  "dropout": 0.2, "learning_rate": 0.001,  "n_episodes": 10},
-    {"hidden_sizes": [256, 128],  "dropout": 0.3, "learning_rate": 0.001,  "n_episodes": 10},
-    {"hidden_sizes": [256, 128],  "dropout": 0.2, "learning_rate": 0.0005, "n_episodes": 10},
-    {"hidden_sizes": [128, 64, 32], "dropout": 0.2, "learning_rate": 0.001, "n_episodes": 10},
+    # Without GRU encoder — fast baseline / short-dataset fallback
+    {"hidden_sizes": [256, 128], "dropout": 0.2, "learning_rate": 0.001,  "n_episodes": 10},
+    {"hidden_sizes": [128, 64],  "dropout": 0.2, "learning_rate": 0.001,  "n_episodes": 10},
+    # With GRU encoder — small encoder, standard lr
+    {"hidden_sizes": [256, 128], "dropout": 0.2, "learning_rate": 0.001,  "n_episodes": 10,
+     "encoder_hidden_size": 64},
+    # With GRU encoder — larger encoder, lower lr (more stable gradient)
+    {"hidden_sizes": [256, 128], "dropout": 0.2, "learning_rate": 0.0005, "n_episodes": 10,
+     "encoder_hidden_size": 128},
+    # With GRU encoder — larger encoder, higher dropout
+    {"hidden_sizes": [256, 128], "dropout": 0.3, "learning_rate": 0.001,  "n_episodes": 10,
+     "encoder_hidden_size": 128},
 ]
 
 
@@ -604,7 +613,7 @@ class ModelTrainer:
                 horizon=horizon,
             )
             dqn_final.train(
-                X_seq_reg_full_s[:, -1, :], returns_full,
+                X_seq_reg_full_s, returns_full,
                 labels=labels_reg, feature_names=feature_names,
             )
 
@@ -891,17 +900,17 @@ class ModelTrainer:
         best_acc = -1.0
         best_params: dict = {}
 
-        X_tab_train  = X_seq_train[:, -1, :]
+        # Pass full 3-D sequences; DQN strips to last timestep internally
+        # when a config has no encoder, so all existing behaviour is preserved.
         returns_train = y_reg_train[:, 0] - 1.0
-        X_tab_val    = X_seq_val[:, -1, :]
 
         for params in _DQN_PARAM_GRID:
             model = DQNPredictor(input_size=n_features, **params, horizon=horizon)
-            model.train(X_tab_train, returns_train,
+            model.train(X_seq_train, returns_train,
                         labels=None, feature_names=feature_names)
 
             if val_labels is not None and len(val_labels) > 0:
-                acc = model.compute_balanced_accuracy(X_tab_val, val_labels)
+                acc = model.compute_balanced_accuracy(X_seq_val, val_labels)
             else:
                 acc = 0.0
 

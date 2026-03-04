@@ -3,10 +3,15 @@
 Design notes
 ------------
 State space
-    Continuous feature vector from the **last timestep** of the scaled
-    sequence window (``X_seq[:, -1, :]``).  No discretisation is required —
-    the neural Q-network generalises to unseen feature combinations through
-    non-linear function approximation, unlike the tabular Q-table.
+    By default: full 60-step sequence window passed through a single-layer GRU
+    encoder, which compresses it to a fixed-size context vector.  When
+    ``encoder_hidden_size`` is not set, falls back to the **last timestep** of
+    the scaled sequence window (``X_seq[:, -1, :]``) for backward compatibility.
+
+    The GRU encoder eliminates *state aliasing*: two situations that share the
+    same current-day features but differ in their recent history now produce
+    distinct state vectors, allowing the Q-network to learn history-dependent
+    trading strategies.
 
 Action space
     0 = SELL  (close / stay flat)
@@ -14,7 +19,13 @@ Action space
     2 = BUY   (open / stay long)
 
 Network architecture
-    Input(n_features) → [Linear → ReLU → Dropout] × n_layers → Linear(3)
+    With GRU encoder (default when encoder_hidden_size is set):
+        GRU(input_size → encoder_hidden_size) →
+        [Linear → ReLU → Dropout] × n_layers → Linear(3)
+
+    Without encoder (legacy / backward-compat):
+        Input(n_features) → [Linear → ReLU → Dropout] × n_layers → Linear(3)
+
     Huber (smooth-L1) loss for robust training against occasional outlier
     rewards.
 
@@ -41,8 +52,10 @@ Reward function  (Moody & Saffell 2001; Spooner et al. 2018)
         tc              = transaction_cost (default 0.1 %)
 
 Input at training / inference
-    Uses the **last timestep** of the seq-scaler-normalised sequence window,
-    i.e. ``X_seq[:, -1, :]`` — exactly what the Ensemble passes as X_seq.
+    3-D ``(N, seq_len, n_features)`` — full sequence window fed through the
+    GRU encoder.  When the encoder is disabled, 2-D ``(N, n_features)`` is
+    also accepted (last-timestep mode).  Passing 3-D to a non-encoder model
+    automatically strips to the last timestep for backward compatibility.
 
 Probability output
     Softmax over Q-values with a tunable temperature.
@@ -76,7 +89,25 @@ def _get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# ── Neural network ────────────────────────────────────────────────────────────
+# ── Neural network components ─────────────────────────────────────────────────
+
+class _GRUEncoder(nn.Module):
+    """Single-layer GRU: (B, seq_len, input_size) → (B, hidden_size).
+
+    Compresses the full sequence history into a fixed-size context vector.
+    The final hidden state captures temporal patterns across all timesteps,
+    giving the Q-network access to the complete 60-day price/indicator history.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.gru     = nn.GRU(input_size, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, h = self.gru(x)                 # h: (1, B, hidden_size)
+        return self.dropout(h.squeeze(0))  # → (B, hidden_size)
+
 
 class _QNetwork(nn.Module):
     """MLP that maps a feature vector to Q-values for 3 actions (SELL/HOLD/BUY)."""
@@ -93,6 +124,30 @@ class _QNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class _DQNNetwork(nn.Module):
+    """Optional GRU encoder + MLP Q-head bundled as one nn.Module.
+
+    Bundling encoder and Q-head means ``_sync_target()`` copies encoder
+    weights automatically via ``load_state_dict()`` — no extra bookkeeping.
+    When ``encoder`` is None the module behaves as a plain Q-network.
+    """
+
+    def __init__(self, encoder: _GRUEncoder | None, q_head: _QNetwork):
+        super().__init__()
+        self.q_head = q_head
+        # Only register encoder as a submodule when it exists so that
+        # state_dict() / load_state_dict() remain schema-consistent.
+        if encoder is not None:
+            self.encoder: _GRUEncoder | None = encoder
+        else:
+            self.encoder = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.encoder is not None:
+            x = self.encoder(x)    # (B, T, F) → (B, hidden_size)
+        return self.q_head(x)      # (B, hidden_size or n_features) → (B, 3)
 
 
 # ── Replay buffer ─────────────────────────────────────────────────────────────
@@ -139,11 +194,15 @@ class DQNPredictor:
     Parameters
     ----------
     input_size:
-        Number of features in the input state vector.
+        Number of features per timestep in the input sequence.
     hidden_sizes:
-        Sizes of the hidden MLP layers (e.g. [256, 128]).
+        Sizes of the hidden MLP Q-head layers (e.g. [256, 128]).
+    encoder_hidden_size:
+        If set, a single-layer GRU encoder is added before the Q-head.
+        The GRU compresses the full sequence to a vector of this size.
+        When ``None`` (default) the model uses only the last timestep.
     dropout:
-        Dropout probability applied after each hidden layer.
+        Dropout probability applied after each hidden layer and the encoder.
     learning_rate:
         Adam optimiser step size.
     batch_size:
@@ -156,9 +215,7 @@ class DQNPredictor:
         Future reward discount γ.
     epsilon_start / epsilon_end:
         ε-greedy linear schedule.  ε decays linearly from ε_start to ε_end
-        over the total number of environment steps (N × n_episodes), ensuring
-        the agent transitions from full exploration to near-greedy exploitation
-        by the end of training regardless of dataset size or episode count.
+        over the total number of environment steps (N × n_episodes).
     n_episodes:
         How many passes over the training time-series.
     transaction_cost:
@@ -173,6 +230,7 @@ class DQNPredictor:
         self,
         input_size: int,
         hidden_sizes: list[int] | None = None,
+        encoder_hidden_size: int | None = None,
         dropout: float | None = None,
         learning_rate: float | None = None,
         batch_size: int | None = None,
@@ -191,42 +249,47 @@ class DQNPredictor:
         def _cfg(key: str, default):
             return get_setting("models", "dqn", key, default=default)
 
-        self.hidden_sizes      = list(hidden_sizes) if hidden_sizes is not None else list(_cfg("hidden_sizes", [256, 128]))
-        self.dropout           = dropout            if dropout            is not None else float(_cfg("dropout", 0.2))
-        self.lr                = learning_rate      if learning_rate      is not None else float(_cfg("learning_rate", 0.001))
-        self.batch_size        = batch_size         if batch_size         is not None else int(_cfg("batch_size", 64))
-        self.buffer_size       = buffer_size        if buffer_size        is not None else int(_cfg("buffer_size", 10000))
-        self.target_update_freq = target_update_freq if target_update_freq is not None else int(_cfg("target_update_freq", 100))
-        self.gamma             = discount_factor    if discount_factor    is not None else float(_cfg("discount_factor", 0.99))
-        self.epsilon_start     = epsilon_start      if epsilon_start      is not None else float(_cfg("epsilon_start", 1.0))
-        self.epsilon_end       = epsilon_end        if epsilon_end        is not None else float(_cfg("epsilon_end", 0.01))
-        self.n_episodes        = n_episodes         if n_episodes         is not None else int(_cfg("n_episodes", 10))
-        self.transaction_cost  = transaction_cost   if transaction_cost   is not None else float(_cfg("transaction_cost", 0.001))
-        self.temperature       = temperature        if temperature        is not None else float(_cfg("temperature", 0.5))
-        self.horizon           = horizon            if horizon            is not None else int(
+        self.hidden_sizes        = list(hidden_sizes) if hidden_sizes is not None else list(_cfg("hidden_sizes", [256, 128]))
+        self.encoder_hidden_size = encoder_hidden_size   # None → no encoder
+        self._use_encoder        = encoder_hidden_size is not None
+        self.dropout             = dropout           if dropout            is not None else float(_cfg("dropout", 0.2))
+        self.lr                  = learning_rate     if learning_rate      is not None else float(_cfg("learning_rate", 0.001))
+        self.batch_size          = batch_size        if batch_size         is not None else int(_cfg("batch_size", 64))
+        self.buffer_size         = buffer_size       if buffer_size        is not None else int(_cfg("buffer_size", 10000))
+        self.target_update_freq  = target_update_freq if target_update_freq is not None else int(_cfg("target_update_freq", 100))
+        self.gamma               = discount_factor   if discount_factor    is not None else float(_cfg("discount_factor", 0.99))
+        self.epsilon_start       = epsilon_start     if epsilon_start      is not None else float(_cfg("epsilon_start", 1.0))
+        self.epsilon_end         = epsilon_end       if epsilon_end        is not None else float(_cfg("epsilon_end", 0.01))
+        self.n_episodes          = n_episodes        if n_episodes         is not None else int(_cfg("n_episodes", 10))
+        self.transaction_cost    = transaction_cost  if transaction_cost   is not None else float(_cfg("transaction_cost", 0.001))
+        self.temperature         = temperature       if temperature        is not None else float(_cfg("temperature", 0.5))
+        self.horizon             = horizon           if horizon            is not None else int(
             get_setting("features", "prediction_horizon", default=1)
         )
-        # Minimum replay buffer size before training begins
         raw_min = int(_cfg("min_buffer_size", self.batch_size))
-        self.min_buffer_size   = max(raw_min, self.batch_size)
+        self.min_buffer_size = max(raw_min, self.batch_size)
 
-        self._device   = _get_device()
-        self._trained  = False
+        self._device  = _get_device()
+        self._trained = False
 
-        # Networks built lazily in train() to allow load() to rebuild correctly
-        self._online_net: _QNetwork | None = None
-        self._target_net: _QNetwork | None = None
+        self._online_net: _DQNNetwork | None = None
+        self._target_net: _DQNNetwork | None = None
         self._optimizer: optim.Optimizer | None = None
 
     # ── Network management ────────────────────────────────────────────────────
 
     def _build_networks(self) -> None:
-        self._online_net = _QNetwork(
-            self.input_size, self.hidden_sizes, self.dropout
-        ).to(self._device)
-        self._target_net = _QNetwork(
-            self.input_size, self.hidden_sizes, self.dropout
-        ).to(self._device)
+        q_in = self.encoder_hidden_size if self._use_encoder else self.input_size
+
+        def _make() -> _DQNNetwork:
+            enc = (
+                _GRUEncoder(self.input_size, self.encoder_hidden_size, self.dropout)
+                if self._use_encoder else None
+            )
+            return _DQNNetwork(enc, _QNetwork(q_in, self.hidden_sizes, self.dropout))
+
+        self._online_net = _make().to(self._device)
+        self._target_net = _make().to(self._device)
         self._target_net.load_state_dict(self._online_net.state_dict())
         self._target_net.eval()
         self._optimizer = optim.Adam(self._online_net.parameters(), lr=self.lr)
@@ -239,19 +302,25 @@ class DQNPredictor:
 
     def train(
         self,
-        X_tab: np.ndarray,           # (N, n_features)  last-timestep features
-        returns_1d: np.ndarray,      # (N,)  1-step price return per step
-        labels: np.ndarray | None = None,   # (N,)  true labels (0/1/2) for logging
-        feature_names: list[str] | None = None,  # accepted for API parity; unused
+        X_tab: np.ndarray,
+        returns_1d: np.ndarray,
+        labels: np.ndarray | None = None,
+        feature_names: list[str] | None = None,
     ) -> dict:
         """Train the DQN agent over chronological time-series data.
 
         Parameters
         ----------
         X_tab:
-            Scaled feature matrix, shape (N, n_features).  This should be the
-            *last* timestep of the sequence window — i.e. the current-bar
-            observation.
+            Scaled feature matrix.  Accepts:
+
+            * ``(N, seq_len, n_features)`` — full sequence windows.  When the
+              GRU encoder is enabled these are passed through the encoder to
+              produce the RL state.  When the encoder is disabled the last
+              timestep is extracted automatically for backward compatibility.
+            * ``(N, n_features)`` — pre-extracted last-timestep features
+              (legacy / non-encoder path).
+
         returns_1d:
             1-step price return r(t) = close[t+1]/close[t] − 1, shape (N,).
         labels:
@@ -260,15 +329,16 @@ class DQNPredictor:
         feature_names:
             Accepted for API parity with other predictors; not used by DQN.
         """
+        # Normalise input: strip to last timestep when encoder is not in use.
+        if X_tab.ndim == 3 and not self._use_encoder:
+            X_tab = X_tab[:, -1, :]
+
         self._build_networks()
         buffer = _ReplayBuffer(self.buffer_size)
 
         N = len(X_tab)
         history: dict = {"episode_rewards": [], "episode_balanced_acc": []}
         total_steps = 0
-        # Total steps over the full training run — used for linear ε schedule.
-        # Linear decay ensures the agent transitions from full exploration at
-        # step 0 to epsilon_end by the last step, regardless of N or n_episodes.
         total_train_steps = max((N - 1) * self.n_episodes, 1)
 
         self._online_net.train()
@@ -280,17 +350,14 @@ class DQNPredictor:
 
             for t in range(N - 1):
                 state = X_tab[t].astype(np.float32)
+                # state shape: (seq_len, n_features) with encoder, (n_features,) without
 
-                # ε linear decay per step: goes from epsilon_start → epsilon_end
-                # over the entire training run (much faster convergence than
-                # per-episode exponential decay for neural Q-functions).
                 epsilon = max(
                     self.epsilon_end,
                     self.epsilon_start - (self.epsilon_start - self.epsilon_end)
                     * total_steps / total_train_steps,
                 )
 
-                # ε-greedy action selection
                 if random.random() < epsilon:
                     action = random.randint(0, 2)
                 else:
@@ -298,24 +365,24 @@ class DQNPredictor:
                         s_t = torch.tensor(
                             state, dtype=torch.float32, device=self._device
                         ).unsqueeze(0)
+                        # s_t: (1, seq_len, n_features) or (1, n_features) — both
+                        # valid for _DQNNetwork.forward()
                         q_vals = self._online_net(s_t).squeeze(0).cpu().numpy()
                     action = int(np.argmax(q_vals))
 
-                # Resolve new position from action
-                if action == 2:      # BUY
+                if action == 2:
                     new_position = 1
-                elif action == 0:    # SELL
+                elif action == 0:
                     new_position = 0
-                else:                # HOLD
+                else:
                     new_position = position
 
-                # Position-based reward with transaction cost
-                r   = float(returns_1d[t])
-                tc  = self.transaction_cost
+                r      = float(returns_1d[t])
+                tc     = self.transaction_cost
                 reward = new_position * r - abs(new_position - position) * tc
 
                 next_state = X_tab[t + 1].astype(np.float32)
-                done = (t == N - 2)  # True at the last valid transition
+                done = (t == N - 2)
 
                 buffer.push(state, action, reward, next_state, done)
 
@@ -324,11 +391,9 @@ class DQNPredictor:
                 pred_labels.append(action)
                 total_steps  += 1
 
-                # Gradient update once buffer is sufficiently filled
                 if len(buffer) >= self.min_buffer_size:
                     self._update(buffer)
 
-                # Sync target network every `target_update_freq` gradient steps
                 if total_steps % self.target_update_freq == 0:
                     self._sync_target()
 
@@ -356,9 +421,10 @@ class DQNPredictor:
 
         self._trained = True
         self._online_net.eval()
+        enc_info = f", encoder_hidden={self.encoder_hidden_size}" if self._use_encoder else ""
         logger.info(
             f"DQN training complete — "
-            f"architecture={self.hidden_sizes}, buffer={len(buffer)}"
+            f"architecture={self.hidden_sizes}{enc_info}, buffer={len(buffer)}"
         )
         return history
 
@@ -371,11 +437,12 @@ class DQNPredictor:
         r  = torch.tensor(rewards,     dtype=torch.float32, device=self._device)
         ns = torch.tensor(next_states, dtype=torch.float32, device=self._device)
         d  = torch.tensor(dones,       dtype=torch.float32, device=self._device)
+        # s / ns shape: (batch, seq_len, n_features) with encoder
+        #               (batch, n_features)           without encoder
+        # _DQNNetwork.forward() handles both paths transparently.
 
-        # Q(s, a) for the actions actually taken
         q_pred = self._online_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
 
-        # Bellman target: r + γ · max_a' Q_target(s', a') · (1 − done)
         with torch.no_grad():
             q_next   = self._target_net(ns).max(dim=1).values
             q_target = r + self.gamma * q_next * (1.0 - d)
@@ -403,16 +470,17 @@ class DQNPredictor:
         """Convert Q-values to class probabilities via temperature softmax.
 
         Accepts either:
-        - 2-D ``(N, n_features)``    — tabular last-step features
-        - 3-D ``(N, T, n_features)`` — sequence; uses the last timestep
+        - 3-D ``(N, seq_len, n_features)`` — full sequence; fed through the
+          GRU encoder when enabled, otherwise last timestep is extracted.
+        - 2-D ``(N, n_features)``          — tabular last-step features.
 
         Returns ``(N, 3)`` float32 array; column order: SELL / HOLD / BUY.
         """
         if not self._trained or self._online_net is None:
             raise RuntimeError("DQN model has not been trained yet.")
 
-        if X.ndim == 3:
-            X = X[:, -1, :]   # take last timestep
+        if X.ndim == 3 and not self._use_encoder:
+            X = X[:, -1, :]   # legacy: strip to last timestep
 
         self._online_net.eval()
         with torch.no_grad():
@@ -438,6 +506,7 @@ class DQNPredictor:
                 "online_state_dict":  self._online_net.state_dict(),
                 "input_size":         self.input_size,
                 "hidden_sizes":       self.hidden_sizes,
+                "encoder_hidden_size": self.encoder_hidden_size,
                 "dropout":            self.dropout,
                 "learning_rate":      self.lr,
                 "batch_size":         self.batch_size,
@@ -455,28 +524,32 @@ class DQNPredictor:
             },
             path,
         )
-        logger.info(f"Saved DQN model ({self.hidden_sizes}) to {path}")
+        enc_info = f", encoder_hidden={self.encoder_hidden_size}" if self._use_encoder else ""
+        logger.info(f"Saved DQN model ({self.hidden_sizes}{enc_info}) to {path}")
 
     def load(self, path: str | Path) -> None:
         data = torch.load(path, map_location=self._device, weights_only=False)
-        self.input_size         = data.get("input_size",         self.input_size)
-        self.hidden_sizes       = data.get("hidden_sizes",       self.hidden_sizes)
-        self.dropout            = data.get("dropout",            self.dropout)
-        self.lr                 = data.get("learning_rate",      self.lr)
-        self.batch_size         = data.get("batch_size",         self.batch_size)
-        self.buffer_size        = data.get("buffer_size",        self.buffer_size)
-        self.target_update_freq = data.get("target_update_freq", self.target_update_freq)
-        self.gamma              = data.get("discount_factor",    self.gamma)
-        self.epsilon_start      = data.get("epsilon_start",      self.epsilon_start)
-        self.epsilon_end        = data.get("epsilon_end",        self.epsilon_end)
-        self.n_episodes         = data.get("n_episodes",         self.n_episodes)
-        self.transaction_cost   = data.get("transaction_cost",   self.transaction_cost)
-        self.temperature        = data.get("temperature",        self.temperature)
-        self.horizon            = data.get("horizon",            self.horizon)
-        self.min_buffer_size    = data.get("min_buffer_size",    self.min_buffer_size)
-        self._trained           = data.get("trained",            False)
+        self.input_size          = data.get("input_size",          self.input_size)
+        self.hidden_sizes        = data.get("hidden_sizes",        self.hidden_sizes)
+        self.encoder_hidden_size = data.get("encoder_hidden_size", None)
+        self._use_encoder        = self.encoder_hidden_size is not None
+        self.dropout             = data.get("dropout",             self.dropout)
+        self.lr                  = data.get("learning_rate",       self.lr)
+        self.batch_size          = data.get("batch_size",          self.batch_size)
+        self.buffer_size         = data.get("buffer_size",         self.buffer_size)
+        self.target_update_freq  = data.get("target_update_freq",  self.target_update_freq)
+        self.gamma               = data.get("discount_factor",     self.gamma)
+        self.epsilon_start       = data.get("epsilon_start",       self.epsilon_start)
+        self.epsilon_end         = data.get("epsilon_end",         self.epsilon_end)
+        self.n_episodes          = data.get("n_episodes",          self.n_episodes)
+        self.transaction_cost    = data.get("transaction_cost",    self.transaction_cost)
+        self.temperature         = data.get("temperature",         self.temperature)
+        self.horizon             = data.get("horizon",             self.horizon)
+        self.min_buffer_size     = data.get("min_buffer_size",     self.min_buffer_size)
+        self._trained            = data.get("trained",             False)
 
         self._build_networks()
         self._online_net.load_state_dict(data["online_state_dict"])
         self._online_net.eval()
-        logger.info(f"Loaded DQN model ({self.hidden_sizes}) from {path}")
+        enc_info = f", encoder_hidden={self.encoder_hidden_size}" if self._use_encoder else ""
+        logger.info(f"Loaded DQN model ({self.hidden_sizes}{enc_info}) from {path}")
