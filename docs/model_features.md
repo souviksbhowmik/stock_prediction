@@ -22,7 +22,8 @@ Stage 5b →  Quarterly financial ratios  (yfinance fundamentals, optional)
 The resulting DataFrame (with labels excluded) forms the **standard feature set**
 used by LSTM, XGBoost, Encoder-Decoder, TFT, Q-learning, and DQN.
 
-XGBoost Lag extends this set with 16 additional lag/trend columns.
+XGBoost Lag and DQN Lag extend this set with 16 additional lag/trend columns
+(same extension, separate scaler).
 Prophet uses a separate subset of carry-forward and lagged regressors.
 
 ---
@@ -30,6 +31,7 @@ Prophet uses a separate subset of carry-forward and lagged regressors.
 ## Standard Feature Set
 
 Used by: **LSTM · XGBoost · Encoder-Decoder · TFT · Q-learning · DQN**
+*(XGBoost Lag and DQN Lag use this set **plus** 16 lag/trend columns — see below)*
 
 ### 1. Price / Volume (OHLCV) — 5 features
 
@@ -238,6 +240,8 @@ look-ahead bias.
 | Scaling | Separate `StandardScaler` (`lag_scaler` in meta.joblib) fit on the extended matrix |
 | How features are used | Same as XGBoost but with the richer feature set. The separate scaler is needed because the additional columns were not seen during standard scaler fitting. |
 
+> The same 16-column extended feature set is shared with **DQN Lag** (see below). Both models read from the same data pipeline (`prepare_training_data_lag()`) and the same fitted `lag_scaler`.
+
 #### 16 Additional Lag / Trend Features
 
 Computed by `add_lag_trend_features()` in `src/stock_prediction/features/technical.py`
@@ -402,10 +406,34 @@ not used by the Q-table state key.
 
 | Property | Value |
 |----------|-------|
-| Input format | Last timestep of scaled sequence: `X_seq[:, −1, :]` |
-| Feature set | **Full standard set** at the current timestep (all n_features columns) |
+| Input format | 3-D sequence `(N, seq_len=60, n_features)` with GRU encoder **or** last timestep `(N, n_features)` without encoder |
+| Feature set | **Full standard set** (all n_features columns) |
 | Scaling | Same `seq_scaler` as LSTM |
-| How features are used | The full feature vector at the last timestep is fed into a fully-connected Q-network: `Input(n_features) → [Linear → ReLU → Dropout] × n_layers → Linear(3)`. No discretisation — the neural network generalises across the continuous feature space. Experience replay and a target network stabilise training. |
+| How features are used | When `encoder_hidden_size` is set (default in tuning), a single-layer GRU compresses the 60-step sequence into a fixed-size context vector before the Q-head. Without an encoder, only the last timestep is used. Experience replay (circular buffer) and a frozen target network stabilise Bellman updates. Q-values are converted to probabilities via temperature softmax. |
+
+---
+
+### DQN Lag
+
+| Property | Value |
+|----------|-------|
+| Input format | 2-D tabular: `(N, n_base + 16)` — one row per day |
+| Feature set | Full standard set **plus** 16 lag/trend features (identical to XGBoost Lag) |
+| Scaling | Same `lag_scaler` as XGBoost Lag (fitted on the extended matrix) |
+| Saved as | `dqn_lag.pt` |
+| How features are used | Temporal context is encoded directly in the lag/trend features (lagged close ratios, ADX, EMA cross, trend slopes, price rank) — no sequence encoder is needed. The flat 2-D feature vector is fed straight into the MLP Q-head: `Input(n_lag_features) → [Linear → ReLU → Dropout] × n_layers → Linear(3)`. Same experience replay + target network as DQN. Trains substantially faster than the sequence-encoder DQN because there is no GRU pass over a 60-step window at every environment step. |
+
+**Reward function** (shared with DQN and Q-Learning):
+
+```
+reward(t) = new_position(t) × r(t) − |Δposition| × tc
+```
+
+where `r(t) = Close_Lag1_Ratio[t+1] − 1` (derived directly from the lag feature vector, no lookahead bias) and `tc` = transaction cost (default 0.1 %).
+
+**Return derivation:**
+`returns_lag[t] = tabular_lag[t+1, idx_Close_Lag1_Ratio] − 1.0`
+The last element is set to 0 and is never used (DQN loop runs over `range(N−1)`).
 
 ---
 
@@ -420,8 +448,8 @@ not used by the Q-table state key.
 | LLM broker scores | 10 | All (if `use_llm=True`) |
 | Quarterly financials | 20 | All (if `use_financials=True`) |
 | **Standard set total** | **~103** | LSTM, XGBoost, ED, TFT, Q-learning, DQN |
-| Lag / trend extensions | +16 | XGBoost Lag only |
-| **XGBoost Lag total** | **~119** | XGBoost Lag |
+| Lag / trend extensions | +16 | XGBoost Lag, DQN Lag |
+| **Extended lag set total** | **~119** | XGBoost Lag, DQN Lag |
 | Carry-forward regressors | up to ~28 | Prophet only |
 | Lagged regressors | up to 19 | Prophet only |
 

@@ -121,16 +121,19 @@ Trains one or more ML models per symbol. When multiple models are selected they 
 |---|---|---|
 | `lstm` (default) | Classifier | Captures temporal patterns across 60-timestep rolling windows |
 | `xgboost` | Classifier | Fast, interpretable; uses tabular feature snapshots |
+| `xgboost_lag` | Classifier | XGBoost on the extended 16-feature lag/trend set (lagged close ratios, ADX, EMA cross, trend slopes, price rank) |
 | `encoder_decoder` | Regressor→signal | Seq2seq LSTM; predicts price ratios for each horizon step; Gaussian CDF → BUY/HOLD/SELL |
 | `prophet` | Regressor→signal | Facebook Prophet time-series model with lag-safe exogenous regressors |
 | `tft` | Regressor→signal | Temporal Fusion Transformer; gated residual networks + multi-head self-attention over sequences |
 | `qlearning` | RL agent | Tabular Q-learning with discretised state space; reward = position-based P&L minus transaction cost |
-| `dqn` | RL agent | Deep Q-Network; continuous-state MLP Q-function with experience replay and target network |
+| `dqn` | RL agent | Deep Q-Network with optional GRU sequence encoder; continuous-state MLP Q-function with experience replay and target network |
+| `dqn_lag` | RL agent | DQN operating on the 16-feature lag/trend vector (same features as `xgboost_lag`); no sequence encoder needed — trains substantially faster than `dqn` |
 | `lstm,xgboost` | Ensemble | Two classifiers; combined via dynamic weights from validation balanced accuracy |
 | `lstm,xgboost,encoder_decoder,prophet` | Ensemble | Four models combined; weights proportional to each model's validation balanced accuracy |
-| `qlearning,dqn` | Ensemble | Both RL agents in an ensemble |
+| `xgboost_lag,dqn_lag` | Ensemble | Both lag-feature models in an ensemble — fast alternative to sequence-model ensembles |
+| `qlearning,dqn,dqn_lag` | Ensemble | All three RL agents combined |
 
-> Any combination of the seven model names works. For single-model selections the weight is 1.0. For ensembles, each model's contribution is proportional to its validation balanced accuracy — better models automatically receive higher weight.
+> Any combination of the nine model names works. For single-model selections the weight is 1.0. For ensembles, each model's contribution is proportional to its validation balanced accuracy — better models automatically receive higher weight.
 
 **Prediction horizon** (`--horizon` / `-h`):
 
@@ -152,11 +155,13 @@ Thresholds are configurable in `config/settings.yaml` under `signals.horizon_thr
 - Files written per symbol to `data/models/{SYMBOL}/` (only for selected models):
   - `lstm.pt` — PyTorch LSTM weights and architecture metadata
   - `xgboost.joblib` — trained XGBoost classifier with feature names
+  - `xgboost_lag.joblib` — trained XGBoost Lag classifier (extended lag feature set)
   - `encoder_decoder.pt` — PyTorch Encoder-Decoder weights
   - `prophet.joblib` — fitted Prophet model with regressors
   - `tft.pt` — PyTorch Temporal Fusion Transformer weights
   - `qlearning.joblib` — Q-table, bin edges, and state feature indices
   - `dqn.pt` — PyTorch DQN Q-network weights
+  - `dqn_lag.pt` — PyTorch DQN-lag Q-network weights (lag feature input)
   - `meta.joblib` — scalers, feature names, selected models, `trained_at` timestamp, `horizon`, `use_news`, `use_llm`, `use_financials`, `val_accuracy`, and per-model ensemble weights
 - Interactive HTML plots per symbol to `data/plots/{SYMBOL}/`:
   - `train_plot.html` — training period actual vs predicted signals
@@ -172,11 +177,15 @@ stockpredict train -m encoder_decoder                    # Encoder-Decoder only
 stockpredict train -m prophet                            # Prophet only
 stockpredict train -m tft                                # Temporal Fusion Transformer only
 stockpredict train -m qlearning                          # Tabular Q-learning only
-stockpredict train -m dqn                                # Deep Q-Network only
+stockpredict train -m dqn                                # Deep Q-Network (GRU sequence encoder)
+stockpredict train -m dqn_lag                            # DQN on lag features (faster, no encoder)
+stockpredict train -m xgboost_lag                        # XGBoost on lag/trend features
 stockpredict train -m lstm,xgboost                       # Ensemble of LSTM + XGBoost
 stockpredict train -m lstm,xgboost,encoder_decoder,prophet  # Classic four-model ensemble
-stockpredict train -m qlearning,dqn                      # RL-only ensemble
+stockpredict train -m xgboost_lag,dqn_lag                # Lag-feature ensemble (fastest training)
+stockpredict train -m qlearning,dqn,dqn_lag              # All RL agents ensemble
 stockpredict train -m lstm,xgboost,tft,qlearning,dqn    # Five-model ensemble
+stockpredict train -m dqn,dqn_lag,lstm                  # Mixed sequence + lag ensemble
 stockpredict train -s RELIANCE.NS -h 1                   # 1-day horizon
 stockpredict train -s RELIANCE.NS -h 10                  # 10-day horizon
 stockpredict train -s RELIANCE.NS --no-news --no-llm     # Technical + financials only (faster)
@@ -206,6 +215,8 @@ stockpredict experiment -s INFY.NS -m lstm,encoder_decoder,prophet
 stockpredict experiment -s INFY.NS -m prophet --horizon 10
 stockpredict experiment -s INFY.NS -m lstm,xgboost --no-news --no-llm
 stockpredict experiment -s INFY.NS -m tft --start-date 2023-01-01
+stockpredict experiment -s INFY.NS -m dqn_lag              # fast RL baseline
+stockpredict experiment -s INFY.NS -m xgboost_lag,dqn_lag  # compare both lag models
 ```
 
 ---
@@ -597,23 +608,31 @@ Each trained symbol has a `data/models/{SYMBOL}/meta.joblib` file containing:
 
 | Field | Description |
 |-------|-------------|
-| `scaler` | Fitted `StandardScaler` for tabular features |
-| `seq_scaler` | Fitted `StandardScaler` for sequence (LSTM/ED) inputs |
-| `feature_names` | Ordered list of feature column names used during training |
-| `input_size` | Number of input features |
-| `selected_models` | List of model names trained (e.g. `["lstm", "xgboost"]`) |
+| `scaler` | Fitted `StandardScaler` for tabular features (XGBoost / standard input) |
+| `seq_scaler` | Fitted `StandardScaler` for sequence inputs (LSTM / ED / TFT / DQN) |
+| `lag_scaler` | Fitted `StandardScaler` for lag/trend features (XGBoost Lag / DQN Lag); `None` if neither is selected |
+| `feature_names` | Ordered list of standard feature column names used during training |
+| `lag_feature_names` | Ordered list of lag/trend feature column names; empty list if not applicable |
+| `input_size` | Number of standard input features (sequence/tabular models) |
+| `lag_input_size` | Number of lag/trend input features (XGBoost Lag / DQN Lag) |
+| `selected_models` | List of model IDs trained (e.g. `["xgboost_lag", "dqn_lag"]`) |
 | `trained_at` | ISO timestamp of training completion |
 | `horizon` | Prediction horizon in trading days (1, 3, 5, 7, or 10) |
 | `use_news` | Whether news features were included during training |
 | `use_llm` | Whether LLM features were included during training |
 | `use_financials` | Whether quarterly financial features were included |
-| `val_accuracy` | Validation balanced accuracy achieved (or `None` for old models) |
-| `lstm_weight` | Ensemble weight for the LSTM model |
-| `xgboost_weight` | Ensemble weight for XGBoost |
-| `encoder_decoder_weight` | Ensemble weight for Encoder-Decoder |
+| `val_accuracy` | Validation balanced accuracy of the ensemble |
+| `lstm_weight` | Ensemble weight for LSTM |
+| `xgb_weight` | Ensemble weight for XGBoost |
+| `xgb_lag_weight` | Ensemble weight for XGBoost Lag |
+| `ed_weight` | Ensemble weight for Encoder-Decoder |
 | `prophet_weight` | Ensemble weight for Prophet |
+| `tft_weight` | Ensemble weight for TFT |
+| `ql_weight` | Ensemble weight for Q-Learning |
+| `dqn_weight` | Ensemble weight for DQN |
+| `dqn_lag_weight` | Ensemble weight for DQN Lag |
 
-> **Backward compatibility:** Models trained before the `horizon` / `use_*` fields were introduced will load correctly with safe defaults. Re-train to capture the new fields.
+> **Backward compatibility:** Models trained before any given field was introduced load correctly with safe defaults (`0.0` for weights, empty list for feature names, etc.). Re-train to capture all current fields.
 
 ---
 
