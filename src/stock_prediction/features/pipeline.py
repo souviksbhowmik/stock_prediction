@@ -175,8 +175,8 @@ class FeaturePipeline:
             nifty_close = nifty_data.df[["Close"]].rename(columns={"Close": "_NIFTY"})
             df = df.join(nifty_close, how="left")
 
-            nifty_1d = df["_NIFTY"].pct_change(1)
-            nifty_5d = df["_NIFTY"].pct_change(5)
+            nifty_1d = df["_NIFTY"].pct_change(1, fill_method=None)
+            nifty_5d = df["_NIFTY"].pct_change(5, fill_method=None)
 
             df["NIFTY_Return_1d"]      = nifty_1d
             df["Relative_Strength_1d"] = df["Close"].pct_change(1) - nifty_1d

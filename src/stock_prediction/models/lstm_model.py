@@ -72,8 +72,8 @@ class LSTMPredictor:
         ).to(self.device)
 
     def _get_device(self) -> torch.device:
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
+        # MPS LSTM backward pass is broken on many PyTorch versions
+        # (assertion in _getLSTMGradKernelDAGObject).  Use CPU instead.
         if torch.cuda.is_available():
             return torch.device("cuda")
         return torch.device("cpu")

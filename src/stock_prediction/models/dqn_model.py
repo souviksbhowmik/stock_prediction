@@ -82,8 +82,8 @@ logger = get_logger("models.dqn")
 
 
 def _get_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+    # MPS GRU/LSTM backward pass is broken on many PyTorch versions
+    # (assertion in _getLSTMGradKernelDAGObject).  Use CPU instead.
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
