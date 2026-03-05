@@ -1035,14 +1035,19 @@ def _run_experimental_bg(
     save_dir: Path,
     progress: dict,
 ) -> None:
-    """Background thread: trains each algorithm sequentially into its own run dir."""
+    """Background thread: trains each algorithm in an isolated subprocess.
+
+    Each algorithm runs inside a ``ProcessPoolExecutor`` worker so that
+    native-library crashes or resource leaks (Prophet/Stan semaphores,
+    PyTorch MPS, XGBoost) are contained within the worker and cannot
+    bring down the Streamlit server.
+    """
+    import concurrent.futures
+    from datetime import datetime as _dt
+    from stock_prediction.models.trainer import train_single_algorithm
+
+    sym_key = symbol.replace(".", "_")
     try:
-        from datetime import datetime as _dt
-        from stock_prediction.models.trainer import ModelTrainer
-        from stock_prediction.config import load_settings
-        load_settings()["features"]["prediction_horizon"] = horizon
-        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
-        sym_key = symbol.replace(".", "_")
         for alg in algorithms:
             if progress.get("cancelled"):
                 break
@@ -1051,10 +1056,15 @@ def _run_experimental_bg(
             run_dir = save_dir / sym_key / "experimental" / run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             try:
-                model, accuracy, _ = trainer.train_stock(
-                    symbol, sd, ed, [alg], experiment_dir=run_dir
-                )
-                if model is None:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        train_single_algorithm,
+                        symbol, alg, sd, ed,
+                        use_news, use_llm, use_financials,
+                        horizon, str(run_dir),
+                    )
+                    accuracy = future.result(timeout=7200)  # 2-hour hard cap
+                if accuracy is None:
                     progress["results"][alg] = {
                         "status": "no_data", "val_accuracy": None, "run_dir": str(run_dir),
                     }
@@ -1062,6 +1072,11 @@ def _run_experimental_bg(
                     progress["results"][alg] = {
                         "status": "success", "val_accuracy": accuracy, "run_dir": str(run_dir),
                     }
+            except concurrent.futures.TimeoutError:
+                progress["results"][alg] = {
+                    "status": "failed", "val_accuracy": None, "run_dir": str(run_dir),
+                    "reason": "Training timed out (>2 hours)",
+                }
             except Exception as e:
                 progress["results"][alg] = {
                     "status": "failed", "val_accuracy": None, "run_dir": str(run_dir),

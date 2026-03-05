@@ -7,6 +7,7 @@ from stock_prediction.models.trainer import (
     list_experiments,
     list_trained_models,
     promote_experiment,
+    train_single_algorithm,
 )
 from stock_prediction.models.encoder_decoder_model import EncoderDecoderPredictor
 from stock_prediction.models.prophet_model import ProphetPredictor
@@ -20,6 +21,7 @@ __all__ = [
     "list_experiments",
     "list_trained_models",
     "promote_experiment",
+    "train_single_algorithm",
     "EncoderDecoderPredictor",
     "ProphetPredictor",
     "DQNLagPredictor",

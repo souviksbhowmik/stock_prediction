@@ -30,6 +30,38 @@ logger = get_logger("models.trainer")
 # are implemented.
 AVAILABLE_MODELS: list[str] = ["lstm", "xgboost", "xgboost_lag", "encoder_decoder", "prophet", "tft", "qlearning", "dqn", "dqn_lag"]
 
+
+def train_single_algorithm(
+    symbol: str,
+    alg: str,
+    sd: str | None,
+    ed: str | None,
+    use_news: bool,
+    use_llm: bool,
+    use_financials: bool,
+    horizon: int,
+    experiment_dir: str,
+) -> float | None:
+    """Train one algorithm in the current process and return val accuracy.
+
+    Intended to be called via ``concurrent.futures.ProcessPoolExecutor`` so
+    that each algorithm training runs in an isolated subprocess.  Native-
+    library crashes or resource leaks (Prophet/Stan, PyTorch MPS, XGBoost)
+    are contained within the subprocess and cannot bring down the Streamlit
+    server.
+    """
+    from stock_prediction.config import load_settings
+
+    load_settings()["features"]["prediction_horizon"] = horizon
+    trainer = ModelTrainer(
+        use_news=use_news, use_llm=use_llm, use_financials=use_financials
+    )
+    model, accuracy, _ = trainer.train_stock(
+        symbol, sd, ed, [alg], experiment_dir=Path(experiment_dir)
+    )
+    return float(accuracy) if model is not None and accuracy is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Hyperparameter search grids
 # ---------------------------------------------------------------------------
