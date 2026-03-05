@@ -213,6 +213,41 @@ def list_experiments(symbol: str, save_dir: Path) -> list[dict]:
     return results
 
 
+def purge_experiments(save_dir: Path, symbol: str | None = None) -> tuple[int, int]:
+    """Delete all experimental run directories, optionally filtered by symbol.
+
+    Returns ``(runs_deleted, bytes_freed)``.
+    """
+    import shutil
+
+    runs_deleted = 0
+    bytes_freed = 0
+
+    if symbol:
+        sym_dirs = [save_dir / symbol.replace(".", "_")]
+    else:
+        sym_dirs = [p for p in save_dir.iterdir() if p.is_dir()] if save_dir.exists() else []
+
+    for sym_dir in sym_dirs:
+        exp_root = sym_dir / "experimental"
+        if not exp_root.exists():
+            continue
+        for run_dir in exp_root.iterdir():
+            if run_dir.is_dir():
+                bytes_freed += sum(
+                    f.stat().st_size for f in run_dir.rglob("*") if f.is_file()
+                )
+                shutil.rmtree(run_dir, ignore_errors=True)
+                runs_deleted += 1
+        # Remove the now-empty experimental dir itself
+        try:
+            exp_root.rmdir()
+        except OSError:
+            pass  # not empty — leave it
+
+    return runs_deleted, bytes_freed
+
+
 def promote_experiment(symbol: str, run_dir: Path, save_dir: Path) -> None:
     """Copy an experimental run's files to the production model directory."""
     import shutil

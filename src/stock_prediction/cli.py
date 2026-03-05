@@ -793,6 +793,61 @@ def delete_experiment(symbol: str, run_id: str):
     console.print(f"[green]✓ Deleted {run_id}[/]")
 
 
+@cli.command("purge-experiments")
+@click.option("--symbol", "-s", default=None, help="Limit purge to one symbol (e.g. INFY.NS). Omit for all symbols.")
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted without removing anything.")
+def purge_experiments_cmd(symbol: str | None, dry_run: bool):
+    """Delete all experimental training runs (across all symbols, or one symbol).
+
+    Use --symbol to restrict the purge to a single stock.
+    Use --dry-run to preview what would be removed without deleting anything.
+    """
+    import shutil
+    from stock_prediction.models.trainer import purge_experiments
+
+    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+
+    if dry_run:
+        # Preview mode — count without deleting
+        sym_dirs = (
+            [save_dir / symbol.replace(".", "_")]
+            if symbol
+            else ([p for p in save_dir.iterdir() if p.is_dir()] if save_dir.exists() else [])
+        )
+        total_runs = 0
+        total_bytes = 0
+        for sym_dir in sym_dirs:
+            exp_root = sym_dir / "experimental"
+            if not exp_root.exists():
+                continue
+            for run_dir in exp_root.iterdir():
+                if run_dir.is_dir():
+                    size = sum(f.stat().st_size for f in run_dir.rglob("*") if f.is_file())
+                    console.print(f"  [dim]{run_dir}[/dim]  ({size / 1024:.1f} KB)")
+                    total_runs += 1
+                    total_bytes += size
+        if total_runs == 0:
+            console.print("[yellow]No experimental runs found.[/yellow]")
+        else:
+            console.print(
+                f"\n[cyan]Would delete {total_runs} run(s) "
+                f"({total_bytes / 1024 / 1024:.2f} MB)[/cyan]"
+            )
+        return
+
+    scope = f"[bold]{symbol}[/]" if symbol else "[bold]ALL symbols[/]"
+    click.confirm(f"Delete all experimental runs for {scope}?", abort=True)
+
+    runs, freed = purge_experiments(save_dir, symbol=symbol)
+    if runs == 0:
+        console.print("[yellow]No experimental runs found — nothing deleted.[/yellow]")
+    else:
+        console.print(
+            f"[green]✓ Deleted {runs} experimental run(s) "
+            f"({freed / 1024 / 1024:.2f} MB freed)[/green]"
+        )
+
+
 @cli.command("model-info")
 @click.option("--symbol", "-s", required=True, help="Stock symbol (e.g. INFY.NS)")
 def model_info(symbol: str):

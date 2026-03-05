@@ -1240,6 +1240,59 @@ def page_experimental_train() -> None:
             time.sleep(2)
             st.rerun()
 
+    # ── Section 3a: Purge all experiments ─────────────────────────────────────
+    _section("Purge Experiments", color="#dc2626")
+    from stock_prediction.models.trainer import purge_experiments
+
+    # Compute stats for the info line
+    all_sym_dirs = [p for p in save_dir.iterdir() if p.is_dir()] if save_dir.exists() else []
+    total_runs = sum(
+        1
+        for sd in all_sym_dirs
+        for rd in (sd / "experimental").iterdir()
+        if (sd / "experimental").exists() and rd.is_dir()
+    )
+    total_mb = sum(
+        f.stat().st_size
+        for sd in all_sym_dirs
+        if (sd / "experimental").exists()
+        for rd in (sd / "experimental").iterdir()
+        if rd.is_dir()
+        for f in rd.rglob("*")
+        if f.is_file()
+    ) / 1024 / 1024
+
+    st.caption(
+        f"{total_runs} experimental run(s) on disk across all symbols "
+        f"— {total_mb:.1f} MB total."
+    )
+
+    purge_col, _, _ = st.columns([2, 2, 3])
+    with purge_col:
+        if st.button("🗑 Purge All Experiments", type="primary", use_container_width=True, disabled=exp_active or total_runs == 0):
+            st.session_state["purge_confirm"] = True
+
+    if st.session_state.get("purge_confirm"):
+        st.warning(
+            f"This will permanently delete **{total_runs} experimental run(s)** "
+            f"({total_mb:.1f} MB) across **all symbols**. "
+            "Production models are not affected."
+        )
+        cy, cn, _ = st.columns([1, 1, 5])
+        with cy:
+            if st.button("✅ Confirm Purge", key="purge_confirm_yes"):
+                runs_del, freed = purge_experiments(save_dir)
+                st.session_state.pop("purge_confirm", None)
+                st.toast(
+                    f"Deleted {runs_del} run(s), freed {freed / 1024 / 1024:.1f} MB",
+                    icon="🗑",
+                )
+                st.rerun()
+        with cn:
+            if st.button("✗ Cancel", key="purge_confirm_no"):
+                st.session_state.pop("purge_confirm", None)
+                st.rerun()
+
     # ── Section 3: Experimental results table ─────────────────────────────────
     sym_for_table = (ep.get("symbol") if ep else None) or symbol_input.strip().upper()
     if sym_for_table:
