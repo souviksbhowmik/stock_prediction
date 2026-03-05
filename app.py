@@ -1249,8 +1249,9 @@ def page_experimental_train() -> None:
     total_runs = sum(
         1
         for sd in all_sym_dirs
+        if (sd / "experimental").exists()
         for rd in (sd / "experimental").iterdir()
-        if (sd / "experimental").exists() and rd.is_dir()
+        if rd.is_dir()
     )
     total_mb = sum(
         f.stat().st_size
