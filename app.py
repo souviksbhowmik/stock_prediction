@@ -299,6 +299,8 @@ def _run_training_bg(
     except Exception as e:
         progress["error"] = str(e)
     finally:
+        import gc
+        gc.collect()
         progress["complete"] = True
         progress["current_sym"] = None
 
@@ -1069,6 +1071,8 @@ def _run_experimental_bg(
     except Exception as e:
         progress["error"] = str(e)
     finally:
+        import gc
+        gc.collect()
         progress["complete"] = True
         progress["current_alg"] = None
 

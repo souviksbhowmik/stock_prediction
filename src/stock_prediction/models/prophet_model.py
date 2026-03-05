@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import gc
+import os
 import warnings
 from pathlib import Path
+
+# Limit Stan/OpenMP threads to 1 to avoid semaphore leaks when Prophet is
+# run inside a threading.Thread (e.g. Streamlit background workers).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("STAN_NUM_THREADS", "1")
 
 import joblib
 import numpy as np
@@ -166,6 +173,7 @@ class ProphetPredictor:
                 if reg in df_train.columns:
                     model.add_regressor(reg)
             model.fit(df_train)
+        gc.collect()
         return model
 
     def _forecast(
