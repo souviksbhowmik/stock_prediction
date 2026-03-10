@@ -41,6 +41,7 @@ def train_single_algorithm(
     use_financials: bool,
     horizon: int,
     experiment_dir: str,
+    save_dir: str | None = None,
 ) -> float | None:
     """Train one algorithm in the current process and return val accuracy.
 
@@ -54,7 +55,8 @@ def train_single_algorithm(
 
     load_settings()["features"]["prediction_horizon"] = horizon
     trainer = ModelTrainer(
-        use_news=use_news, use_llm=use_llm, use_financials=use_financials
+        use_news=use_news, use_llm=use_llm, use_financials=use_financials,
+        save_dir=Path(save_dir) if save_dir else None,
     )
     model, accuracy, _ = trainer.train_stock(
         symbol, sd, ed, [alg], experiment_dir=Path(experiment_dir)
@@ -266,6 +268,7 @@ class ModelTrainer:
         use_news: bool = True,
         use_llm: bool = True,
         use_financials: bool = True,
+        save_dir: Path | None = None,
     ):
         self.use_news = use_news
         self.use_llm = use_llm
@@ -273,7 +276,7 @@ class ModelTrainer:
         self.pipeline = FeaturePipeline(
             use_news=use_news, use_llm=use_llm, use_financials=use_financials
         )
-        self.save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+        self.save_dir = save_dir or Path(get_setting("models", "save_dir", default="data/models"))
         self.train_split = get_setting("models", "train_split", default=0.8)
 
     # =========================================================================
@@ -910,7 +913,7 @@ class ModelTrainer:
                 logger.warning(f"Could not generate predicted signals for plot: {pe}")
 
             if dates_all is not None and close_all is not None:
-                plot_save_dir = Path(get_setting("models", "save_dir", default="data/models")).parent / "plots"
+                plot_save_dir = self.save_dir.parent / "plots"
                 train_end_for_plot = (
                     split_idx + (seq_len if sequences is not None else 0)
                 )
