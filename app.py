@@ -17,6 +17,8 @@ import streamlit as st
 # Make the installed package importable when running from the project root.
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+from stock_prediction.auth import authenticate, list_users, delete_user, clear_user_data
+
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="StockPredict India",
@@ -248,6 +250,139 @@ def _suggestion_df(suggestions) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ─── Auth helpers ─────────────────────────────────────────────────────────────
+
+_USER_SCOPED_KEYS = (
+    "suggest_result", "shortlist_result", "screen_result",
+    "train_results", "train_progress",
+    "predict_signals", "predict_warnings", "predict_signal_metas",
+    "exp_progress",
+    "portfolio_trades", "gain_report",
+    "watchlist",
+)
+
+
+def _clear_user_session() -> None:
+    """Remove all result/progress keys that belong to a specific user session."""
+    for _k in _USER_SCOPED_KEYS:
+        st.session_state.pop(_k, None)
+
+
+def _get_save_dir() -> Path:
+    from stock_prediction.config import get_setting
+    profile = st.session_state.get("profile")
+    if profile:
+        return profile.save_dir
+    return Path(get_setting("models", "save_dir", default="data/models"))
+
+
+def page_login() -> None:
+    st.title("Welcome to StockPredict")
+    st.markdown("*Indian Market · NIFTY 50*")
+    st.markdown("---")
+    col, _ = st.columns([1, 1])
+    with col:
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login / Register", type="primary", use_container_width=True):
+            u = username.strip()
+            if not u:
+                st.error("Please enter a username.")
+            else:
+                try:
+                    profile = authenticate(u, password)
+                    _clear_user_session()
+                    st.session_state["profile"] = profile
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        st.caption("No account? Just enter a new username to auto-register.")
+        st.markdown("---")
+        st.markdown("**Quick access**")
+        qc1, qc2 = st.columns(2)
+        with qc1:
+            if st.button("Default", use_container_width=True):
+                _clear_user_session()
+                st.session_state["profile"] = authenticate("default", "")
+                st.rerun()
+        with qc2:
+            if st.button("Admin", use_container_width=True):
+                _clear_user_session()
+                st.session_state["profile"] = authenticate("admin", "")
+                st.rerun()
+
+
+def page_admin() -> None:
+    st.title("🔐 Admin — User Management")
+    users = list_users()
+
+    rows = []
+    for u in users:
+        models_count = 0
+        disk_mb = 0.0
+        if u.save_dir.exists():
+            files = list(u.save_dir.rglob("*"))
+            models_count = sum(1 for f in files if f.is_file())
+            disk_mb = sum(f.stat().st_size for f in files if f.is_file()) / 1_048_576
+        rows.append({
+            "Username": u.username,
+            "Role": u.role,
+            "Display Name": u.display_name,
+            "Registered": u.created_at[:10],
+            "Models": models_count,
+            "Disk MB": f"{disk_mb:.2f}",
+        })
+
+    _show_table(pd.DataFrame(rows))
+
+    st.markdown("---")
+    st.markdown("### Per-user actions")
+    for u in users:
+        is_builtin = u.username in ("default", "admin")
+        with st.expander(f"{u.display_name} ({u.username}) — {u.role}", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "Clear Data",
+                    key=f"admin_clear_{u.username}",
+                    disabled=is_builtin,
+                    help="Delete models & plots but keep account",
+                ):
+                    try:
+                        n, b = clear_user_data(u.username)
+                        st.success(f"Cleared {n} files ({b/1_048_576:.1f} MB)")
+                    except Exception as exc:
+                        st.error(str(exc))
+            with c2:
+                confirm_key = f"admin_del_confirm_{u.username}"
+                if not st.session_state.get(confirm_key):
+                    if st.button(
+                        "Delete User",
+                        key=f"admin_del_{u.username}",
+                        disabled=is_builtin,
+                        type="primary",
+                        help="Remove account and all data permanently",
+                    ):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    st.warning(f"Delete **{u.username}** and all their data?")
+                    cy, cn = st.columns(2)
+                    with cy:
+                        if st.button("Yes, delete", key=f"admin_del_yes_{u.username}", type="primary"):
+                            try:
+                                delete_user(u.username)
+                                st.session_state.pop(confirm_key, None)
+                                st.success(f"Deleted user {u.username}")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+                    with cn:
+                        if st.button("Cancel", key=f"admin_del_no_{u.username}"):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+
+
 # ─── Background training worker ──────────────────────────────────────────────
 
 def _run_training_bg(
@@ -260,6 +395,7 @@ def _run_training_bg(
     selected_models: list[str],
     horizon: int,
     progress: dict,
+    save_dir: Path | None = None,
 ) -> None:
     """Runs in a daemon thread — keeps going even if the user navigates away."""
     try:
@@ -267,7 +403,7 @@ def _run_training_bg(
         from stock_prediction.config import load_settings
         # Override horizon in the cached config so all pipeline calls use it
         load_settings()["features"]["prediction_horizon"] = horizon
-        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm, use_financials=use_financials)
+        trainer = ModelTrainer(use_news=use_news, use_llm=use_llm, use_financials=use_financials, save_dir=save_dir)
         for i, sym in enumerate(symbol_list):
             if progress.get("cancelled"):
                 break
@@ -406,11 +542,24 @@ def _predict_for_symbol(symbol, trainer, signal_gen):
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
+_profile = st.session_state.get("profile")
+if _profile and _profile.is_admin and "🔐 Admin" not in PAGES:
+    PAGES.append("🔐 Admin")
+
 with st.sidebar:
     st.markdown("## 📈 StockPredict")
     st.markdown("*Indian Market · NIFTY 50*")
     st.markdown("---")
     page = st.radio("Navigate", PAGES, label_visibility="collapsed")
+    # User info + logout
+    if _profile:
+        st.markdown("---")
+        _uc1, _uc2 = st.columns([3, 1])
+        _uc1.markdown(f"👤 **{_profile.display_name}** `{_profile.role}`")
+        if _uc2.button("→", key="sidebar_logout", help="Logout"):
+            _clear_user_session()
+            st.session_state.pop("profile", None)
+            st.rerun()
     # Training status badge — visible from every page
     _tp = st.session_state.get("train_progress")
     if _tp and not _tp.get("complete"):
@@ -657,7 +806,7 @@ def page_lookup() -> None:
             from stock_prediction.models.trainer import ModelTrainer
             from stock_prediction.signals.generator import SignalGenerator
 
-            trainer = ModelTrainer()
+            trainer = ModelTrainer(save_dir=_get_save_dir())
             signal_gen = SignalGenerator()
             rows = []
 
@@ -1014,6 +1163,7 @@ def page_train() -> None:
                 selected_models,
                 horizon,
                 progress,
+                _get_save_dir(),
             ),
             daemon=True,
         )
@@ -1062,6 +1212,7 @@ def _run_experimental_bg(
                         symbol, alg, sd, ed,
                         use_news, use_llm, use_financials,
                         horizon, str(run_dir),
+                        str(save_dir),
                     )
                     accuracy = future.result(timeout=7200)  # 2-hour hard cap
                 if accuracy is None:
@@ -1100,11 +1251,10 @@ def page_experimental_train() -> None:
         "Production models are never touched during experimental runs."
     )
 
-    from stock_prediction.config import get_setting
     from stock_prediction.models.trainer import AVAILABLE_MODELS, list_experiments, promote_experiment
     import shutil
 
-    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+    save_dir = _get_save_dir()
 
     ep = st.session_state.get("exp_progress")
     exp_active = ep is not None and not ep.get("complete", False)
@@ -1406,7 +1556,7 @@ def page_predict() -> None:
                 from stock_prediction.signals.generator import SignalGenerator
                 from stock_prediction.config import get_setting
 
-                trainer = ModelTrainer()
+                trainer = ModelTrainer(save_dir=_get_save_dir())
                 signal_gen = SignalGenerator()
                 staleness = get_setting("models", "staleness_warning_days", default=30)
 
@@ -1472,8 +1622,7 @@ def page_predict() -> None:
     pr_cols = st.columns(_PR_WIDTHS)
     for col, hdr in zip(pr_cols, _PR_HEADERS):
         col.markdown(f"**{hdr}**")
-    from pathlib import Path as _PPath
-    _plot_base = _PPath("data/plots")
+    _plot_base = _get_save_dir().parent / "plots"
     for sig in signals:
         sym_plots = _plot_base / sig.symbol.replace(".", "_")
         pred_path = sym_plots / f"{sig.symbol}_pred_plot.html"
@@ -1562,7 +1711,7 @@ def page_analyze() -> None:
 
             signal = None
             try:
-                trainer = ModelTrainer()
+                trainer = ModelTrainer(save_dir=_get_save_dir())
                 signal_gen = SignalGenerator()
                 staleness = get_setting("models", "staleness_warning_days", default=30)
                 # _predict_for_symbol handles feature flags/horizon from meta
@@ -2051,14 +2200,12 @@ def page_settings() -> None:
 
 # ─── Model Catalogue ──────────────────────────────────────────────────────────
 def page_catalogue() -> None:
-    from pathlib import Path
-    from stock_prediction.config import get_setting
     from stock_prediction.models.trainer import list_trained_models
 
     st.title("📚 Model Catalogue")
     st.caption("Browse all trained models. Select a symbol to see full details.")
 
-    save_dir = Path(get_setting("models", "save_dir", default="data/models"))
+    save_dir = _get_save_dir()
 
     WEIGHT_KEYS = {
         "lstm":            "lstm_weight",
@@ -2225,6 +2372,12 @@ PAGE_MAP = {
     "💼 Portfolio":  page_portfolio,
     "📈 Gain Report": page_gain_report,
     "⚙️ Settings":   page_settings,
+    "🔐 Admin":      page_admin,
 }
+
+# Login gate
+if st.session_state.get("profile") is None:
+    page_login()
+    st.stop()
 
 PAGE_MAP[page]()
